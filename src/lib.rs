@@ -24,6 +24,16 @@ pub struct TelemetryFrame {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TelemetryStreamCursor {
+    pub device_id: String,
+    pub gateway_id: String,
+    pub last_source_sequence: u64,
+    pub last_observed_at: String,
+    pub last_received_at: String,
+    pub last_batch_digest_sha256: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct TelemetryBatchEvidence {
     pub schema_version: String,
     pub device_id: String,
@@ -155,6 +165,59 @@ pub fn validate_batch_evidence(
         records_validated: validated.len(),
         batch_digest_sha256: hex_lowercase(digest.finalize()),
     })
+}
+
+pub fn validate_continuation(
+    cursor: &TelemetryStreamCursor,
+    frames: &[TelemetryFrame],
+) -> Result<(TelemetryBatchEvidence, TelemetryStreamCursor), ValidationError> {
+    let evidence = validate_batch_evidence(frames)?;
+    if evidence.device_id != cursor.device_id || evidence.gateway_id != cursor.gateway_id {
+        return Err(ValidationError {
+            code: "telemetry_cursor_identity_changed",
+            message: "continuation must use the cursor device and gateway".to_owned(),
+        });
+    }
+    if evidence.first_source_sequence != cursor.last_source_sequence.saturating_add(1) {
+        return Err(ValidationError {
+            code: "telemetry_cursor_sequence_gap",
+            message: "continuation must start at the next source sequence".to_owned(),
+        });
+    }
+    let first_received_at = frames
+        .first()
+        .ok_or_else(|| ValidationError {
+            code: "empty_telemetry_batch",
+            message: "telemetry batch must contain at least one frame".to_owned(),
+        })?
+        .received_at
+        .as_str();
+    if validate_timestamp("first_observed_at", &evidence.first_observed_at)?
+        < validate_timestamp("last_observed_at", &cursor.last_observed_at)?
+        || validate_timestamp("first_received_at", first_received_at)?
+            < validate_timestamp("last_received_at", &cursor.last_received_at)?
+    {
+        return Err(ValidationError {
+            code: "telemetry_cursor_time_regression",
+            message: "continuation timestamps must not regress".to_owned(),
+        });
+    }
+    let next = TelemetryStreamCursor {
+        device_id: evidence.device_id.clone(),
+        gateway_id: evidence.gateway_id.clone(),
+        last_source_sequence: evidence.last_source_sequence,
+        last_observed_at: evidence.last_observed_at.clone(),
+        last_received_at: frames
+            .last()
+            .ok_or_else(|| ValidationError {
+                code: "empty_telemetry_batch",
+                message: "telemetry batch must contain at least one frame".to_owned(),
+            })?
+            .received_at
+            .clone(),
+        last_batch_digest_sha256: evidence.batch_digest_sha256.clone(),
+    };
+    Ok((evidence, next))
 }
 
 pub fn validate(frame: TelemetryFrame) -> Result<ValidatedTelemetry, ValidationError> {
@@ -395,6 +458,48 @@ mod tests {
         assert_eq!(
             evidence,
             validate_batch_evidence(&[first, second]).expect("same batch should be deterministic")
+        );
+    }
+
+    #[test]
+    fn accepts_next_batch_from_stream_cursor() {
+        let first = valid_frame();
+        let first_evidence =
+            validate_batch_evidence(&[first.clone()]).expect("first batch should validate");
+        let cursor = TelemetryStreamCursor {
+            device_id: first_evidence.device_id,
+            gateway_id: first_evidence.gateway_id,
+            last_source_sequence: first_evidence.last_source_sequence,
+            last_observed_at: first_evidence.last_observed_at,
+            last_received_at: first.received_at,
+            last_batch_digest_sha256: first_evidence.batch_digest_sha256,
+        };
+        let mut second = valid_frame();
+        second.source_sequence = 2;
+        second.observed_at = "2026-08-12T00:00:02Z".to_owned();
+        second.received_at = "2026-08-12T00:00:03Z".to_owned();
+        let (_, next) =
+            validate_continuation(&cursor, &[second]).expect("next batch should validate");
+        assert_eq!(next.last_source_sequence, 2);
+    }
+
+    #[test]
+    fn rejects_replayed_batch_from_stream_cursor() {
+        let first = valid_frame();
+        let first_evidence =
+            validate_batch_evidence(&[first.clone()]).expect("first batch should validate");
+        let cursor = TelemetryStreamCursor {
+            device_id: first_evidence.device_id,
+            gateway_id: first_evidence.gateway_id,
+            last_source_sequence: first_evidence.last_source_sequence,
+            last_observed_at: first_evidence.last_observed_at,
+            last_received_at: first.received_at,
+            last_batch_digest_sha256: first_evidence.batch_digest_sha256,
+        };
+        let replay = valid_frame();
+        assert_eq!(
+            validate_continuation(&cursor, &[replay]).unwrap_err().code,
+            "telemetry_cursor_sequence_gap"
         );
     }
 

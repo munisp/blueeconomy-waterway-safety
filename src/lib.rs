@@ -5,6 +5,8 @@ use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter, Write};
+use std::fs;
+use std::path::Path;
 
 pub const MAX_PAYLOAD_BYTES: usize = 1_048_576;
 pub const MAX_JSON_BYTES: usize = 1_500_000;
@@ -23,7 +25,7 @@ pub struct TelemetryFrame {
     pub payload_sha256: String,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TelemetryStreamCursor {
     pub device_id: String,
     pub gateway_id: String,
@@ -165,6 +167,74 @@ pub fn validate_batch_evidence(
         records_validated: validated.len(),
         batch_digest_sha256: hex_lowercase(digest.finalize()),
     })
+}
+
+pub fn load_stream_cursor(path: &Path) -> Result<TelemetryStreamCursor, ValidationError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| ValidationError {
+        code: "cursor_read_failed",
+        message: error.to_string(),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ValidationError {
+            code: "invalid_cursor_path",
+            message: "cursor path must be a regular file and not a symbolic link".to_owned(),
+        });
+    }
+    let raw = fs::read(path).map_err(|error| ValidationError {
+        code: "cursor_read_failed",
+        message: error.to_string(),
+    })?;
+    let cursor: TelemetryStreamCursor =
+        serde_json::from_slice(&raw).map_err(|error| ValidationError {
+            code: "invalid_cursor_json",
+            message: error.to_string(),
+        })?;
+    validate_identifier("cursor.device_id", &cursor.device_id, 256)?;
+    validate_identifier("cursor.gateway_id", &cursor.gateway_id, 256)?;
+    if cursor.last_source_sequence == 0 {
+        return Err(ValidationError {
+            code: "invalid_cursor_sequence",
+            message: "cursor source sequence must be greater than zero".to_owned(),
+        });
+    }
+    validate_timestamp("cursor.last_observed_at", &cursor.last_observed_at)?;
+    validate_timestamp("cursor.last_received_at", &cursor.last_received_at)?;
+    validate_sha256(&cursor.last_batch_digest_sha256)?;
+    Ok(cursor)
+}
+
+pub fn save_stream_cursor(
+    path: &Path,
+    cursor: &TelemetryStreamCursor,
+) -> Result<(), ValidationError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| ValidationError {
+            code: "cursor_write_failed",
+            message: error.to_string(),
+        })?;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ValidationError {
+                code: "invalid_cursor_path",
+                message: "cursor path must be a regular file and not a symbolic link".to_owned(),
+            });
+        }
+    }
+    let encoded = serde_json::to_vec(cursor).map_err(|error| ValidationError {
+        code: "cursor_encode_failed",
+        message: error.to_string(),
+    })?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&temporary, encoded).map_err(|error| ValidationError {
+        code: "cursor_write_failed",
+        message: error.to_string(),
+    })?;
+    fs::rename(&temporary, path).map_err(|error| ValidationError {
+        code: "cursor_write_failed",
+        message: error.to_string(),
+    })?;
+    Ok(())
 }
 
 pub fn validate_continuation(
@@ -481,6 +551,31 @@ mod tests {
         let (_, next) =
             validate_continuation(&cursor, &[second]).expect("next batch should validate");
         assert_eq!(next.last_source_sequence, 2);
+    }
+
+    #[test]
+    fn persists_and_reloads_stream_cursor() {
+        let first = valid_frame();
+        let evidence = validate_batch_evidence(&[first.clone()]).expect("batch should validate");
+        let cursor = TelemetryStreamCursor {
+            device_id: evidence.device_id,
+            gateway_id: evidence.gateway_id,
+            last_source_sequence: evidence.last_source_sequence,
+            last_observed_at: evidence.last_observed_at,
+            last_received_at: first.received_at,
+            last_batch_digest_sha256: evidence.batch_digest_sha256,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "blueeconomy-cursor-{}-{}.json",
+            std::process::id(),
+            cursor.last_source_sequence
+        ));
+        save_stream_cursor(&path, &cursor).expect("cursor should persist");
+        assert_eq!(
+            load_stream_cursor(&path).expect("cursor should reload"),
+            cursor
+        );
+        std::fs::remove_file(path).expect("cursor should be removable");
     }
 
     #[test]

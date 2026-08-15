@@ -24,6 +24,19 @@ pub struct TelemetryFrame {
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct TelemetryBatchEvidence {
+    pub schema_version: String,
+    pub device_id: String,
+    pub gateway_id: String,
+    pub first_source_sequence: u64,
+    pub last_source_sequence: u64,
+    pub first_observed_at: String,
+    pub last_observed_at: String,
+    pub records_validated: usize,
+    pub batch_digest_sha256: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct ValidatedTelemetry {
     pub device_id: String,
     pub gateway_id: String,
@@ -101,6 +114,47 @@ pub fn validate_ordered_frames(
         validated.push(current);
     }
     Ok(validated)
+}
+
+pub fn validate_batch_evidence(
+    frames: &[TelemetryFrame],
+) -> Result<TelemetryBatchEvidence, ValidationError> {
+    let validated = validate_ordered_frames(frames)?;
+    let first = validated.first().ok_or_else(|| ValidationError {
+        code: "empty_telemetry_batch",
+        message: "telemetry batch must contain at least one frame".to_owned(),
+    })?;
+    let last = validated.last().ok_or_else(|| ValidationError {
+        code: "empty_telemetry_batch",
+        message: "telemetry batch must contain at least one frame".to_owned(),
+    })?;
+    let mut digest = Sha256::new();
+    for record in &validated {
+        digest.update(record.device_id.as_bytes());
+        digest.update([0]);
+        digest.update(record.gateway_id.as_bytes());
+        digest.update([0]);
+        digest.update(record.source_sequence.to_be_bytes());
+        digest.update(record.observed_at.as_bytes());
+        digest.update([0]);
+        digest.update(record.received_at.as_bytes());
+        digest.update([0]);
+        digest.update(record.data_classification.as_bytes());
+        digest.update([0]);
+        digest.update(record.payload_sha256.as_bytes());
+        digest.update([0]);
+    }
+    Ok(TelemetryBatchEvidence {
+        schema_version: "blueeconomy.waterway-safety.batch-evidence.v1".to_owned(),
+        device_id: first.device_id.clone(),
+        gateway_id: first.gateway_id.clone(),
+        first_source_sequence: first.source_sequence,
+        last_source_sequence: last.source_sequence,
+        first_observed_at: first.observed_at.clone(),
+        last_observed_at: last.observed_at.clone(),
+        records_validated: validated.len(),
+        batch_digest_sha256: hex_lowercase(digest.finalize()),
+    })
 }
 
 pub fn validate(frame: TelemetryFrame) -> Result<ValidatedTelemetry, ValidationError> {
@@ -319,6 +373,29 @@ mod tests {
         second.received_at = "2026-08-12T00:00:03Z".to_owned();
         let result = validate_ordered_frames(&[first, second]).expect("ordered frames should pass");
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn emits_hash_bound_batch_evidence_for_ordered_telemetry() {
+        let first = valid_frame();
+        let mut second = valid_frame();
+        second.source_sequence = 2;
+        second.observed_at = "2026-08-12T00:00:02Z".to_owned();
+        second.received_at = "2026-08-12T00:00:03Z".to_owned();
+        let evidence = validate_batch_evidence(&[first.clone(), second.clone()])
+            .expect("batch should validate");
+        assert_eq!(evidence.records_validated, 2);
+        assert_eq!(evidence.first_source_sequence, 1);
+        assert_eq!(evidence.last_source_sequence, 2);
+        assert_eq!(
+            evidence.schema_version,
+            "blueeconomy.waterway-safety.batch-evidence.v1"
+        );
+        assert_eq!(evidence.batch_digest_sha256.len(), 64);
+        assert_eq!(
+            evidence,
+            validate_batch_evidence(&[first, second]).expect("same batch should be deterministic")
+        );
     }
 
     #[test]

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.blueeconomy.local/s6/gateway-telemetry-profile.schema.json",
+  "title": "S6 Gateway Telemetry Profile",
+  "description": "Gateway-neutral input profile. G1 manifest must provide device/gateway identity ownership, transport trust root, signature profile and rules policy version.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["device_id", "gateway_id", "source_sequence", "observed_at", "received_at", "payload_sha256", "classification"],
+  "properties": {
+    "device_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
+    "gateway_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
+    "source_sequence": {"type": "integer", "minimum": 1},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "received_at": {"type": "string", "format": "date-time"},
+    "payload_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "classification": {"type": "string", "enum": ["PUBLIC", "RESTRICTED", "CONFIDENTIAL"]},
+    "signature": {"type": "string", "minLength": 1, "description": "G1-defined detached or envelope signature; required when the manifest enables signed transport."},
+    "rules_policy_version": {"type": "string", "minLength": 1, "maxLength": 128}
+  }
+}

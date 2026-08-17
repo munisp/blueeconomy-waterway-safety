@@ -628,3 +628,102 @@ mod tests {
         assert_eq!(validate(frame).unwrap_err().code, "invalid_source_sequence");
     }
 }
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafetyRulePolicy {
+    pub policy_version: String,
+    pub max_batch_records: usize,
+    pub allowed_classifications: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct SafetyRuleEvaluation {
+    pub policy_version: String,
+    pub decision: String,
+    pub reasons: Vec<String>,
+    pub batch_digest_sha256: String,
+}
+
+pub fn evaluate_safety_policy(
+    policy: &SafetyRulePolicy,
+    frames: &[TelemetryFrame],
+) -> Result<SafetyRuleEvaluation, ValidationError> {
+    if policy.policy_version.trim().is_empty() || policy.policy_version.len() > 128 {
+        return Err(ValidationError {
+            code: "invalid_policy_version",
+            message: "policy_version must be nonempty and at most 128 bytes".to_owned(),
+        });
+    }
+    if policy.max_batch_records == 0 || policy.allowed_classifications.is_empty() {
+        return Err(ValidationError {
+            code: "invalid_safety_policy",
+            message: "policy must define positive max_batch_records and allowed classifications"
+                .to_owned(),
+        });
+    }
+    let evidence = validate_batch_evidence(frames)?;
+    let mut reasons = Vec::new();
+    if evidence.records_validated > policy.max_batch_records {
+        reasons.push("batch_record_limit_exceeded".to_owned());
+    }
+    for frame in frames {
+        if !policy
+            .allowed_classifications
+            .iter()
+            .any(|value| value == &frame.data_classification)
+        {
+            reasons.push("classification_not_allowed".to_owned());
+            break;
+        }
+    }
+    Ok(SafetyRuleEvaluation {
+        policy_version: policy.policy_version.clone(),
+        decision: if reasons.is_empty() {
+            "ACCEPT".to_owned()
+        } else {
+            "REJECT".to_owned()
+        },
+        reasons,
+        batch_digest_sha256: evidence.batch_digest_sha256,
+    })
+}
+
+#[cfg(test)]
+mod safety_policy_tests {
+    use super::*;
+    fn frame() -> TelemetryFrame {
+        TelemetryFrame {
+            device_id: "device-001".to_owned(),
+            gateway_id: "gateway-001".to_owned(),
+            source_sequence: 1,
+            observed_at: "2026-08-12T00:00:00Z".to_owned(),
+            received_at: "2026-08-12T00:00:01Z".to_owned(),
+            data_classification: "internal".to_owned(),
+            payload_base64: "Ynl0ZXM=".to_owned(),
+            payload_sha256: hex_lowercase(Sha256::digest(b"bytes")),
+        }
+    }
+    #[test]
+    fn evaluates_versioned_policy_without_embedded_thresholds() {
+        let policy = SafetyRulePolicy {
+            policy_version: "ministry-policy-v1".to_owned(),
+            max_batch_records: 1,
+            allowed_classifications: vec!["internal".to_owned()],
+        };
+        let result = evaluate_safety_policy(&policy, &[frame()]).expect("valid policy evaluation");
+        assert_eq!(result.decision, "ACCEPT");
+        assert_eq!(result.policy_version, "ministry-policy-v1");
+    }
+    #[test]
+    fn rejects_policy_violations_deterministically() {
+        let policy = SafetyRulePolicy {
+            policy_version: "ministry-policy-v1".to_owned(),
+            max_batch_records: 1,
+            allowed_classifications: vec!["restricted".to_owned()],
+        };
+        let result = evaluate_safety_policy(&policy, &[frame()]).expect("valid evidence");
+        assert_eq!(result.decision, "REJECT");
+        assert_eq!(result.reasons, vec!["classification_not_allowed"]);
+    }
+}

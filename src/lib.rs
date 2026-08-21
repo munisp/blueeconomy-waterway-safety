@@ -2,6 +2,7 @@
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, FixedOffset};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::{Display, Formatter, Write};
@@ -421,6 +422,263 @@ fn hex_lowercase(bytes: impl AsRef<[u8]>) -> String {
     encoded
 }
 
+pub const MAX_DEVICE_REGISTRY_BYTES: usize = 4_194_304;
+pub const MAX_DEVICE_REGISTRY_ENTRIES: usize = 10_000;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedTelemetryFrame {
+    pub frame: TelemetryFrame,
+    pub signature_key_id: String,
+    pub signature_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceRegistry {
+    pub schema_version: String,
+    pub registry_version: String,
+    pub devices: Vec<DeviceRegistryEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceRegistryEntry {
+    pub device_id: String,
+    pub gateway_id: String,
+    pub key_id: String,
+    pub public_key_base64: String,
+    pub status: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ValidatedSignedTelemetry {
+    pub schema_version: String,
+    pub registry_version: String,
+    pub device_id: String,
+    pub gateway_id: String,
+    pub source_sequence: u64,
+    pub observed_at: String,
+    pub received_at: String,
+    pub data_classification: String,
+    pub payload_sha256: String,
+    pub payload_byte_count: usize,
+    pub signature_key_id: String,
+}
+
+pub fn validate_signed_json(
+    input: &[u8],
+    registry: &DeviceRegistry,
+) -> Result<ValidatedSignedTelemetry, ValidationError> {
+    if input.is_empty() || input.len() > MAX_JSON_BYTES {
+        return Err(ValidationError {
+            code: "invalid_input_size",
+            message: format!(
+                "signed telemetry JSON must contain between 1 and {MAX_JSON_BYTES} bytes"
+            ),
+        });
+    }
+    let frame: SignedTelemetryFrame =
+        serde_json::from_slice(input).map_err(|error| ValidationError {
+            code: "invalid_json",
+            message: error.to_string(),
+        })?;
+    validate_signed_frame(frame, registry)
+}
+
+pub fn load_device_registry(path: &Path) -> Result<DeviceRegistry, ValidationError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| ValidationError {
+        code: "registry_read_failed",
+        message: error.to_string(),
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ValidationError {
+            code: "invalid_registry_path",
+            message: "device registry path must be a regular file and not a symbolic link"
+                .to_owned(),
+        });
+    }
+    if metadata.len() == 0 || metadata.len() > MAX_DEVICE_REGISTRY_BYTES as u64 {
+        return Err(ValidationError {
+            code: "invalid_registry_size",
+            message: format!(
+                "device registry must contain between 1 and {MAX_DEVICE_REGISTRY_BYTES} bytes"
+            ),
+        });
+    }
+    let raw = fs::read(path).map_err(|error| ValidationError {
+        code: "registry_read_failed",
+        message: error.to_string(),
+    })?;
+    let registry: DeviceRegistry =
+        serde_json::from_slice(&raw).map_err(|error| ValidationError {
+            code: "invalid_registry_json",
+            message: error.to_string(),
+        })?;
+    validate_device_registry(&registry)?;
+    Ok(registry)
+}
+
+pub fn validate_signed_frame(
+    frame: SignedTelemetryFrame,
+    registry: &DeviceRegistry,
+) -> Result<ValidatedSignedTelemetry, ValidationError> {
+    validate_device_registry(registry)?;
+    let validated = validate(frame.frame.clone())?;
+    validate_identifier("signature_key_id", &frame.signature_key_id, 256)?;
+    let entry = registry
+        .devices
+        .iter()
+        .find(|candidate| {
+            candidate.device_id == validated.device_id
+                && candidate.gateway_id == validated.gateway_id
+                && candidate.key_id == frame.signature_key_id
+        })
+        .ok_or_else(|| ValidationError {
+            code: "unknown_device_key",
+            message: "device, gateway, and signing key are not registered together".to_owned(),
+        })?;
+    if entry.status != "active" {
+        return Err(ValidationError {
+            code: "device_not_active",
+            message: "registered device signing key is not active".to_owned(),
+        });
+    }
+    let public_key = decode_verifying_key(&entry.public_key_base64)?;
+    let signature_bytes = STANDARD
+        .decode(frame.signature_base64.as_bytes())
+        .map_err(|error| ValidationError {
+            code: "invalid_signature_encoding",
+            message: error.to_string(),
+        })?;
+    let signature = Signature::from_slice(&signature_bytes).map_err(|error| ValidationError {
+        code: "invalid_signature",
+        message: error.to_string(),
+    })?;
+    let preimage = signed_telemetry_preimage(&frame.frame, &frame.signature_key_id)?;
+    public_key
+        .verify(&preimage, &signature)
+        .map_err(|_| ValidationError {
+            code: "signature_verification_failed",
+            message: "Ed25519 signature does not verify the canonical telemetry preimage"
+                .to_owned(),
+        })?;
+    Ok(ValidatedSignedTelemetry {
+        schema_version: "blueeconomy.waterway-safety.signed-telemetry.v1".to_owned(),
+        registry_version: registry.registry_version.clone(),
+        device_id: validated.device_id,
+        gateway_id: validated.gateway_id,
+        source_sequence: validated.source_sequence,
+        observed_at: validated.observed_at,
+        received_at: validated.received_at,
+        data_classification: validated.data_classification,
+        payload_sha256: validated.payload_sha256,
+        payload_byte_count: validated.payload_byte_count,
+        signature_key_id: frame.signature_key_id,
+    })
+}
+
+pub fn validate_signed_continuation(
+    cursor: &TelemetryStreamCursor,
+    frame: SignedTelemetryFrame,
+    registry: &DeviceRegistry,
+) -> Result<(ValidatedSignedTelemetry, TelemetryStreamCursor), ValidationError> {
+    let validated = validate_signed_frame(frame.clone(), registry)?;
+    let (_, next) = validate_continuation(cursor, &[frame.frame])?;
+    Ok((validated, next))
+}
+
+pub fn signed_telemetry_preimage(
+    frame: &TelemetryFrame,
+    signature_key_id: &str,
+) -> Result<Vec<u8>, ValidationError> {
+    validate_identifier("signature_key_id", signature_key_id, 256)?;
+    validate_identifier("device_id", &frame.device_id, 256)?;
+    validate_identifier("gateway_id", &frame.gateway_id, 256)?;
+    validate_timestamp("observed_at", &frame.observed_at)?;
+    validate_timestamp("received_at", &frame.received_at)?;
+    validate_classification(&frame.data_classification)?;
+    validate_sha256(&frame.payload_sha256)?;
+    let fields = [
+        "blueeconomy.waterway-safety.signed-telemetry.v1",
+        signature_key_id,
+        frame.device_id.as_str(),
+        frame.gateway_id.as_str(),
+        frame.observed_at.as_str(),
+        frame.received_at.as_str(),
+        frame.data_classification.as_str(),
+        frame.payload_sha256.as_str(),
+    ];
+    let mut preimage = Vec::with_capacity(
+        fields.iter().map(|field| field.len() + 1).sum::<usize>() + std::mem::size_of::<u64>(),
+    );
+    for field in fields {
+        preimage.extend_from_slice(field.as_bytes());
+        preimage.push(0);
+    }
+    preimage.extend_from_slice(&frame.source_sequence.to_be_bytes());
+    Ok(preimage)
+}
+
+fn validate_device_registry(registry: &DeviceRegistry) -> Result<(), ValidationError> {
+    if registry.schema_version != "blueeconomy.waterway-safety.device-registry.v1" {
+        return Err(ValidationError {
+            code: "invalid_registry_schema",
+            message: "device registry schema_version is not supported".to_owned(),
+        });
+    }
+    validate_identifier("registry_version", &registry.registry_version, 256)?;
+    if registry.devices.is_empty() || registry.devices.len() > MAX_DEVICE_REGISTRY_ENTRIES {
+        return Err(ValidationError {
+            code: "invalid_registry_entries",
+            message: format!(
+                "device registry must contain between 1 and {MAX_DEVICE_REGISTRY_ENTRIES} entries"
+            ),
+        });
+    }
+    for (index, entry) in registry.devices.iter().enumerate() {
+        validate_identifier("registry.device_id", &entry.device_id, 256)?;
+        validate_identifier("registry.gateway_id", &entry.gateway_id, 256)?;
+        validate_identifier("registry.key_id", &entry.key_id, 256)?;
+        if !matches!(entry.status.as_str(), "active" | "suspended" | "revoked") {
+            return Err(ValidationError {
+                code: "invalid_device_status",
+                message: "device registry status must be active, suspended, or revoked".to_owned(),
+            });
+        }
+        decode_verifying_key(&entry.public_key_base64)?;
+        if registry.devices[..index].iter().any(|previous| {
+            previous.device_id == entry.device_id
+                && previous.gateway_id == entry.gateway_id
+                && previous.key_id == entry.key_id
+        }) {
+            return Err(ValidationError {
+                code: "duplicate_device_key",
+                message: "device registry has a duplicate device, gateway, and key identifier"
+                    .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn decode_verifying_key(value: &str) -> Result<VerifyingKey, ValidationError> {
+    let bytes = STANDARD
+        .decode(value.as_bytes())
+        .map_err(|error| ValidationError {
+            code: "invalid_public_key_encoding",
+            message: error.to_string(),
+        })?;
+    let encoded: [u8; 32] = bytes.try_into().map_err(|_| ValidationError {
+        code: "invalid_public_key_length",
+        message: "Ed25519 public key must contain exactly 32 bytes".to_owned(),
+    })?;
+    VerifyingKey::from_bytes(&encoded).map_err(|error| ValidationError {
+        code: "invalid_public_key",
+        message: error.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -725,5 +983,122 @@ mod safety_policy_tests {
         let result = evaluate_safety_policy(&policy, &[frame()]).expect("valid evidence");
         assert_eq!(result.decision, "REJECT");
         assert_eq!(result.reasons, vec!["classification_not_allowed"]);
+    }
+}
+
+#[cfg(test)]
+mod signed_telemetry_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn telemetry_frame(sequence: u64) -> TelemetryFrame {
+        TelemetryFrame {
+            device_id: "device-signed-001".to_owned(),
+            gateway_id: "gateway-signed-001".to_owned(),
+            source_sequence: sequence,
+            observed_at: if sequence == 1 {
+                "2026-08-21T00:00:00Z".to_owned()
+            } else {
+                "2026-08-21T00:00:02Z".to_owned()
+            },
+            received_at: if sequence == 1 {
+                "2026-08-21T00:00:01Z".to_owned()
+            } else {
+                "2026-08-21T00:00:03Z".to_owned()
+            },
+            data_classification: "internal".to_owned(),
+            payload_base64: "Ynl0ZXM=".to_owned(),
+            payload_sha256: hex_lowercase(Sha256::digest(b"bytes")),
+        }
+    }
+
+    fn signed_fixture(sequence: u64, status: &str) -> (SignedTelemetryFrame, DeviceRegistry) {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let frame = telemetry_frame(sequence);
+        let key_id = "device-key-2026-01".to_owned();
+        let preimage = signed_telemetry_preimage(&frame, &key_id).expect("fixture preimage");
+        let signature = signing_key.sign(&preimage);
+        let signed = SignedTelemetryFrame {
+            frame: frame.clone(),
+            signature_key_id: key_id.clone(),
+            signature_base64: STANDARD.encode(signature.to_bytes()),
+        };
+        let registry = DeviceRegistry {
+            schema_version: "blueeconomy.waterway-safety.device-registry.v1".to_owned(),
+            registry_version: "local-fixture-v1".to_owned(),
+            devices: vec![DeviceRegistryEntry {
+                device_id: frame.device_id,
+                gateway_id: frame.gateway_id,
+                key_id,
+                public_key_base64: STANDARD.encode(signing_key.verifying_key().as_bytes()),
+                status: status.to_owned(),
+            }],
+        };
+        (signed, registry)
+    }
+
+    #[test]
+    fn accepts_active_registered_ed25519_signed_telemetry() {
+        let (signed, registry) = signed_fixture(1, "active");
+        let validated = validate_signed_frame(signed, &registry).expect("signed fixture is valid");
+        assert_eq!(
+            validated.schema_version,
+            "blueeconomy.waterway-safety.signed-telemetry.v1"
+        );
+        assert_eq!(validated.registry_version, "local-fixture-v1");
+        assert_eq!(validated.source_sequence, 1);
+        assert_eq!(validated.signature_key_id, "device-key-2026-01");
+    }
+
+    #[test]
+    fn rejects_suspended_or_revoked_device_keys() {
+        for status in ["suspended", "revoked"] {
+            let (signed, registry) = signed_fixture(1, status);
+            assert_eq!(
+                validate_signed_frame(signed, &registry).unwrap_err().code,
+                "device_not_active"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_signature_after_sequence_tampering() {
+        let (mut signed, registry) = signed_fixture(1, "active");
+        signed.frame.source_sequence = 2;
+        assert_eq!(
+            validate_signed_frame(signed, &registry).unwrap_err().code,
+            "signature_verification_failed"
+        );
+    }
+
+    #[test]
+    fn rejects_unregistered_signing_key() {
+        let (mut signed, registry) = signed_fixture(1, "active");
+        signed.signature_key_id = "unregistered-key".to_owned();
+        assert_eq!(
+            validate_signed_frame(signed, &registry).unwrap_err().code,
+            "unknown_device_key"
+        );
+    }
+
+    #[test]
+    fn validates_signed_cursor_continuation_without_replay() {
+        let (first, registry) = signed_fixture(1, "active");
+        let first_validated =
+            validate_signed_frame(first.clone(), &registry).expect("first signed frame");
+        let cursor = TelemetryStreamCursor {
+            device_id: first_validated.device_id,
+            gateway_id: first_validated.gateway_id,
+            last_source_sequence: first_validated.source_sequence,
+            last_observed_at: first_validated.observed_at,
+            last_received_at: first_validated.received_at,
+            last_batch_digest_sha256: validate_batch_evidence(&[first.frame])
+                .expect("first evidence")
+                .batch_digest_sha256,
+        };
+        let (second, _) = signed_fixture(2, "active");
+        let (_, next) = validate_signed_continuation(&cursor, second, &registry)
+            .expect("next signed frame should continue the cursor");
+        assert_eq!(next.last_source_sequence, 2);
     }
 }

@@ -1227,3 +1227,240 @@ mod signed_registry_loading_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod p0_error_path_regressions {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temporary_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "blueeconomy-waterway-safety-p0-{label}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ))
+    }
+
+    fn frame(sequence: u64) -> TelemetryFrame {
+        TelemetryFrame {
+            device_id: "device-p0-001".to_owned(),
+            gateway_id: "gateway-p0-001".to_owned(),
+            source_sequence: sequence,
+            observed_at: if sequence == 1 {
+                "2026-08-21T00:00:00Z".to_owned()
+            } else {
+                "2026-08-21T00:00:02Z".to_owned()
+            },
+            received_at: if sequence == 1 {
+                "2026-08-21T00:00:01Z".to_owned()
+            } else {
+                "2026-08-21T00:00:03Z".to_owned()
+            },
+            data_classification: "internal".to_owned(),
+            payload_base64: "Ynl0ZXM=".to_owned(),
+            payload_sha256: hex_lowercase(Sha256::digest(b"bytes")),
+        }
+    }
+
+    fn valid_cursor() -> TelemetryStreamCursor {
+        let first = frame(1);
+        let evidence = validate_batch_evidence(&[first.clone()]).expect("fixture evidence");
+        TelemetryStreamCursor {
+            device_id: first.device_id,
+            gateway_id: first.gateway_id,
+            last_source_sequence: 1,
+            last_observed_at: first.observed_at,
+            last_received_at: first.received_at,
+            last_batch_digest_sha256: evidence.batch_digest_sha256,
+        }
+    }
+
+    fn signed_fixture() -> (SignedTelemetryFrame, DeviceRegistry) {
+        let signing_key = SigningKey::from_bytes(&[31_u8; 32]);
+        let unsigned = frame(1);
+        let key_id = "p0-key-v1".to_owned();
+        let signature = signing_key
+            .sign(&signed_telemetry_preimage(&unsigned, &key_id).expect("fixture preimage"));
+        let signed = SignedTelemetryFrame {
+            frame: unsigned.clone(),
+            signature_key_id: key_id.clone(),
+            signature_base64: STANDARD.encode(signature.to_bytes()),
+        };
+        let registry = DeviceRegistry {
+            schema_version: "blueeconomy.waterway-safety.device-registry.v1".to_owned(),
+            registry_version: "p0-registry-v1".to_owned(),
+            devices: vec![DeviceRegistryEntry {
+                device_id: unsigned.device_id,
+                gateway_id: unsigned.gateway_id,
+                key_id,
+                public_key_base64: STANDARD.encode(signing_key.verifying_key().as_bytes()),
+                status: "active".to_owned(),
+            }],
+        };
+        (signed, registry)
+    }
+
+    #[test]
+    fn rejects_empty_malformed_and_oversized_signed_json_before_signature_processing() {
+        let (_, registry) = signed_fixture();
+        assert_eq!(
+            validate_signed_json(&[], &registry).unwrap_err().code,
+            "invalid_input_size"
+        );
+        assert_eq!(
+            validate_signed_json(b"{", &registry).unwrap_err().code,
+            "invalid_json"
+        );
+        assert_eq!(
+            validate_signed_json(&vec![b' '; MAX_JSON_BYTES + 1], &registry)
+                .unwrap_err()
+                .code,
+            "invalid_input_size"
+        );
+    }
+
+    #[test]
+    fn rejects_registry_read_path_size_and_json_failures() {
+        let missing = temporary_path("missing");
+        assert_eq!(
+            load_device_registry(&missing).unwrap_err().code,
+            "registry_read_failed"
+        );
+
+        let directory = temporary_path("directory");
+        fs::create_dir(&directory).expect("create directory fixture");
+        assert_eq!(
+            load_device_registry(&directory).unwrap_err().code,
+            "invalid_registry_path"
+        );
+        fs::remove_dir(&directory).expect("remove directory fixture");
+
+        let empty = temporary_path("empty");
+        fs::write(&empty, []).expect("write empty registry");
+        assert_eq!(
+            load_device_registry(&empty).unwrap_err().code,
+            "invalid_registry_size"
+        );
+        fs::remove_file(&empty).expect("remove empty registry");
+
+        let malformed = temporary_path("malformed");
+        fs::write(&malformed, b"{").expect("write malformed registry");
+        assert_eq!(
+            load_device_registry(&malformed).unwrap_err().code,
+            "invalid_registry_json"
+        );
+        fs::remove_file(&malformed).expect("remove malformed registry");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_registry_and_cursor_symbolic_links() {
+        use std::os::unix::fs::symlink;
+
+        let target = temporary_path("symlink-target");
+        fs::write(&target, b"{}").expect("write target");
+        let registry_link = temporary_path("registry-link");
+        symlink(&target, &registry_link).expect("create registry link");
+        assert_eq!(
+            load_device_registry(&registry_link).unwrap_err().code,
+            "invalid_registry_path"
+        );
+
+        let cursor_link = temporary_path("cursor-link");
+        symlink(&target, &cursor_link).expect("create cursor link");
+        assert_eq!(
+            load_stream_cursor(&cursor_link).unwrap_err().code,
+            "invalid_cursor_path"
+        );
+        assert_eq!(
+            save_stream_cursor(&cursor_link, &valid_cursor())
+                .unwrap_err()
+                .code,
+            "invalid_cursor_path"
+        );
+
+        fs::remove_file(&registry_link).expect("remove registry link");
+        fs::remove_file(&cursor_link).expect("remove cursor link");
+        fs::remove_file(&target).expect("remove target");
+    }
+
+    #[test]
+    fn rejects_invalid_signature_and_registry_status_before_acceptance() {
+        let (mut signed, registry) = signed_fixture();
+        signed.signature_base64 = "!not-base64!".to_owned();
+        assert_eq!(
+            validate_signed_frame(signed, &registry).unwrap_err().code,
+            "invalid_signature_encoding"
+        );
+
+        let (mut signed, mut registry) = signed_fixture();
+        signed.signature_base64 = "AA==".to_owned();
+        assert_eq!(
+            validate_signed_frame(signed, &registry).unwrap_err().code,
+            "invalid_signature"
+        );
+
+        let (signed, _) = signed_fixture();
+        registry.devices[0].status = "retired".to_owned();
+        assert_eq!(
+            validate_signed_frame(signed, &registry).unwrap_err().code,
+            "invalid_device_status"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_cursor_json_sequence_and_continuation_time_regression() {
+        let malformed = temporary_path("cursor-malformed");
+        fs::write(&malformed, b"{").expect("write malformed cursor");
+        assert_eq!(
+            load_stream_cursor(&malformed).unwrap_err().code,
+            "invalid_cursor_json"
+        );
+        fs::remove_file(&malformed).expect("remove malformed cursor");
+
+        let zero = temporary_path("cursor-zero");
+        let mut cursor = valid_cursor();
+        cursor.last_source_sequence = 0;
+        fs::write(
+            &zero,
+            serde_json::to_vec(&cursor).expect("serialize cursor"),
+        )
+        .expect("write zero cursor");
+        assert_eq!(
+            load_stream_cursor(&zero).unwrap_err().code,
+            "invalid_cursor_sequence"
+        );
+        fs::remove_file(&zero).expect("remove zero cursor");
+
+        let cursor = valid_cursor();
+        let mut next = frame(2);
+        next.observed_at = "2026-08-20T23:59:59Z".to_owned();
+        next.received_at = "2026-08-21T00:00:02Z".to_owned();
+        assert_eq!(
+            validate_continuation(&cursor, &[next]).unwrap_err().code,
+            "telemetry_cursor_time_regression"
+        );
+    }
+
+    #[test]
+    fn rejects_empty_batches_and_refuses_cursor_write_to_directory() {
+        assert_eq!(
+            validate_ordered_frames(&[]).unwrap_err().code,
+            "empty_telemetry_batch"
+        );
+        let directory = temporary_path("cursor-directory");
+        fs::create_dir(&directory).expect("create cursor directory");
+        assert_eq!(
+            save_stream_cursor(&directory, &valid_cursor())
+                .unwrap_err()
+                .code,
+            "invalid_cursor_path"
+        );
+        fs::remove_dir(&directory).expect("remove cursor directory");
+    }
+}

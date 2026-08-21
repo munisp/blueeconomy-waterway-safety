@@ -1102,3 +1102,128 @@ mod signed_telemetry_tests {
         assert_eq!(next.last_source_sequence, 2);
     }
 }
+
+#[cfg(test)]
+mod signed_registry_loading_tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn temporary_registry_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "blueeconomy-waterway-safety-{label}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_nanos()
+        ))
+    }
+
+    fn signed_registry_document(status: &str, schema_version: &str) -> (Vec<u8>, Vec<u8>) {
+        let signing_key = SigningKey::from_bytes(&[19_u8; 32]);
+        let frame = TelemetryFrame {
+            device_id: "device-registry-001".to_owned(),
+            gateway_id: "gateway-registry-001".to_owned(),
+            source_sequence: 4,
+            observed_at: "2026-08-21T00:00:00Z".to_owned(),
+            received_at: "2026-08-21T00:00:01Z".to_owned(),
+            data_classification: "internal".to_owned(),
+            payload_base64: "Ynl0ZXM=".to_owned(),
+            payload_sha256: hex_lowercase(Sha256::digest(b"bytes")),
+        };
+        let key_id = "registry-file-key-v1";
+        let signature =
+            signing_key.sign(&signed_telemetry_preimage(&frame, key_id).expect("fixture preimage"));
+        let registry = serde_json::json!({
+            "schema_version": schema_version,
+            "registry_version": "registry-file-fixture-v1",
+            "devices": [{
+                "device_id": frame.device_id,
+                "gateway_id": frame.gateway_id,
+                "key_id": key_id,
+                "public_key_base64": STANDARD.encode(signing_key.verifying_key().as_bytes()),
+                "status": status
+            }]
+        });
+        let signed = serde_json::json!({
+            "frame": {
+                "device_id": "device-registry-001",
+                "gateway_id": "gateway-registry-001",
+                "source_sequence": 4,
+                "observed_at": "2026-08-21T00:00:00Z",
+                "received_at": "2026-08-21T00:00:01Z",
+                "data_classification": "internal",
+                "payload_base64": "Ynl0ZXM=",
+                "payload_sha256": hex_lowercase(Sha256::digest(b"bytes"))
+            },
+            "signature_key_id": key_id,
+            "signature_base64": STANDARD.encode(signature.to_bytes())
+        });
+        (
+            serde_json::to_vec(&registry).expect("encode registry fixture"),
+            serde_json::to_vec(&signed).expect("encode signed fixture"),
+        )
+    }
+
+    #[test]
+    fn loads_registry_file_and_validates_serialized_signed_input() {
+        let (registry_document, signed_document) =
+            signed_registry_document("active", "blueeconomy.waterway-safety.device-registry.v1");
+        let path = temporary_registry_path("load");
+        fs::write(&path, registry_document).expect("write registry fixture");
+        let registry = load_device_registry(&path).expect("load valid registry fixture");
+        let result =
+            validate_signed_json(&signed_document, &registry).expect("signed document passes");
+        assert_eq!(result.source_sequence, 4);
+        fs::remove_file(path).expect("remove registry fixture");
+    }
+
+    #[test]
+    fn rejects_unsupported_registry_schema_before_signature_validation() {
+        let (registry_document, _) = signed_registry_document("active", "unsupported-registry-v1");
+        let path = temporary_registry_path("schema");
+        fs::write(&path, registry_document).expect("write registry fixture");
+        assert_eq!(
+            load_device_registry(&path).unwrap_err().code,
+            "invalid_registry_schema"
+        );
+        fs::remove_file(path).expect("remove registry fixture");
+    }
+
+    #[test]
+    fn rejects_duplicate_registry_key_tuple() {
+        let (registry_document, signed_document) =
+            signed_registry_document("active", "blueeconomy.waterway-safety.device-registry.v1");
+        let registry: DeviceRegistry =
+            serde_json::from_slice(&registry_document).expect("fixture registry");
+        let signed: SignedTelemetryFrame =
+            serde_json::from_slice(&signed_document).expect("fixture signed telemetry");
+        let duplicate = registry.devices[0].clone();
+        let registry = DeviceRegistry {
+            schema_version: registry.schema_version,
+            registry_version: registry.registry_version,
+            devices: vec![registry.devices[0].clone(), duplicate],
+        };
+        assert_eq!(
+            validate_signed_frame(signed, &registry).unwrap_err().code,
+            "duplicate_device_key"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_registered_public_key_before_signature_validation() {
+        let (registry_document, signed_document) =
+            signed_registry_document("active", "blueeconomy.waterway-safety.device-registry.v1");
+        let mut registry: DeviceRegistry =
+            serde_json::from_slice(&registry_document).expect("fixture registry");
+        let signed: SignedTelemetryFrame =
+            serde_json::from_slice(&signed_document).expect("fixture signed telemetry");
+        registry.devices[0].public_key_base64 = "AA==".to_owned();
+        assert_eq!(
+            validate_signed_frame(signed, &registry).unwrap_err().code,
+            "invalid_public_key_length"
+        );
+    }
+}

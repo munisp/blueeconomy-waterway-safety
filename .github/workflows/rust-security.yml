@@ -1,0 +1,56 @@
+name: Rust security
+
+on:
+  pull_request:
+    paths:
+      - '**.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/rust-security.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - '**.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/rust-security.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit-and-test:
+    name: Rust 1.85 audit and validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust 1.85.1
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master at 2026-08-21
+        with:
+          toolchain: 1.85.1
+          components: rustfmt, clippy
+
+      - name: Install Cargo-audit 0.22.0
+        run: cargo install cargo-audit --version 0.22.0 --locked
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run strict Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run all Rust tests
+        run: cargo test --all-targets --locked
+
+      - name: Fail on RustSec advisories
+        run: cargo audit --deny warnings

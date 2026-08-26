@@ -54,3 +54,14 @@ jobs:
 
       - name: Fail on RustSec advisories
         run: cargo audit --deny warnings
+
+      - name: Audit locked dependencies against OSV
+        run: python3 scripts/audit_osv.py --lock Cargo.lock --output artifacts/osv-audit.json
+
+      - name: Retain OSV audit report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: osv-audit
+          path: artifacts/osv-audit.json
+          if-no-files-found: error

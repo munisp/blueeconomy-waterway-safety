@@ -38,6 +38,88 @@ The `geo` module implements the corridor-safety analytics feeding the NIMASA das
 
 The `ingest` module tolerates out-of-order `ferries.telemetry.v1` delivery. `ReorderIngestor` buffers validated frames and re-emits them ordered by `(observed_at, source_sequence)` once they fall outside a watermark-driven, configurable lateness window. Frames arriving later than the window, invalid frames, and frames offered at buffer capacity are rejected to an explicit `DeadLetterEvent` outcome and are never silently applied.
 
+## Vessel-side edge gateway (Workstream B)
+
+The `gateway` binary (`src/bin/gateway.rs`) is the reference edge gateway for
+the connected/intermittent vessel telemetry profiles. Three inputs sit behind
+traits — AIS NMEA 0183 sentences (`AisSentenceSource`, RMC/GGA with mandatory
+checksums; malformed sentences are dead-lettered, never fatal), LoRaWAN sensor
+uplinks (`SensorUplinkSource`, JSON envelope + documented binary payloads for
+engine/bilge/life-jacket sensors, see `src/sensor.rs`), and a health heartbeat
+(`HeartbeatSource`). Everything is normalized into `TelemetryFrame`.
+
+```
+ AIS receiver ──NMEA 0183/TCP──► ┌────────────── gateway (RasPi) ───────────────┐
+                                 │ nmea.rs: RMC/GGA parse, checksum enforced     │
+ LoRaWAN NS bridge ─JSONL/TCP──► │ sensor.rs: engine/bilge/life-jacket decode    │
+                                 │ gateway.rs: normalize → TelemetryFrame        │
+ health timer ──────────────────► │   observed_at: GPS time else hybrid clock     │
+                                 │ ingest.rs: ReorderIngestor (300 s window,     │
+                                 │   watermark; late ⇒ explicit dead letter)     │
+                                 └───────┬───────────────────────┬──────────────┘
+                       uplink up         │                       │ uplink down
+                            ┌────────────▼─────────┐   ┌─────────▼─────────────┐
+                            │ uplink.rs            │   │ journal.rs            │
+                            │ BatchBuilder         │   │ append-only segments, │
+                            │ (deterministic keys, │   │ SHA-256 records,      │
+                            │  JSON-lines batches) │   │ rotation, bounded:    │
+                            └──────────┬───────────┘   │ overflow ⇒ oldest to  │
+                 ┌─────────────────────┴─────────┐     │ overflow-dead-letter  │
+                 │ fluvio (feature) / kafka       │◄────│ replay oldest-first,  │
+                 │ (feature) — config-only swap   │ ack │ truncate only after   │
+                 └─────────────────┬───────────────┘     │ acknowledged        │
+                                   ▼                     └─────────────────────┘
+                        ferries.telemetry.v1
+                        (Fluvio pier cluster; SmartModule compresses+batches;
+                         Kafka fallback surface)
+```
+
+Transport is selected by configuration only (`UPLINK_TRANSPORT`), Dapr-style:
+the same frames flow either way. The Fluvio producer is a real client behind
+`--features fluvio-transport`; the Kafka fallback producer behind
+`--features kafka-transport`. Building without a transport feature is allowed,
+but selecting that transport at startup fails closed (`transport_unavailable`).
+Batch payload compression is delegated to the transport/SmartModule (see
+`src/uplink.rs` module docs); no gateway-local zstd pass is compiled (would be
+a new dependency requiring governance sign-off).
+
+### Gateway configuration (environment)
+
+| Variable | Required | Default | Purpose |
+|----------|----------|---------|---------|
+| `GATEWAY_ID` | yes | — | gateway identity on every frame |
+| `VESSEL_DEVICE_ID` | yes | — | device identity for AIS position frames |
+| `JOURNAL_DIR` | yes | — | local spool journal directory |
+| `UPLINK_TRANSPORT` | yes | — | `fluvio` or `kafka` |
+| `UPLINK_ENDPOINT` | no | `""` | kafka bootstrap `host:port,...`; fluvio profile override |
+| `TELEMETRY_TOPIC` | no | `ferries.telemetry.v1` | unified ingestion topic |
+| `DATA_CLASSIFICATION` | no | `internal` | approved classification value |
+| `AIS_LISTEN_ADDR` | no | `127.0.0.1:10110` | NMEA TCP listener |
+| `SENSOR_LISTEN_ADDR` | no | `127.0.0.1:10111` | LoRaWAN bridge JSON-lines listener |
+| `HEARTBEAT_INTERVAL_SECONDS` | no | `30` | health heartbeat period (doubles as recovery probe) |
+| `LATENESS_WINDOW_SECONDS` | no | `300` | reorder window; keep aligned with the 5-minute freshness KPI |
+| `JOURNAL_MAX_SEGMENT_BYTES` | no | `4194304` | journal segment rotation size |
+| `JOURNAL_MAX_BYTES` | no | `67108864` | total journal budget (bounded) |
+| `JOURNAL_OVERFLOW_MAX_BYTES` | no | `16777216` | overflow dead-letter sink budget |
+| `BATCH_MAX_RECORDS` / `BATCH_MAX_BYTES` | no | `128` / `900000` | uplink batch bounds |
+
+Journal overflow policy: the oldest *sealed* segments are moved to
+`overflow-dead-letter.jsonl` with counters (`records_dead_lettered_overflow`)
+— never silent; if the sink is full the append fails closed and the newest
+data is retained. Replay truncates segments only after the uplink
+acknowledges the batch that carried them; the ack cursor is persisted
+atomically. Any journal corruption (bad checksum, torn tail, tampered ack
+cursor) halts the gateway closed with `journal_corruption`.
+
+### Wazuh integration and deployment
+
+`wazuh/` ships the agent `ossec.conf` fragment (JSON log monitoring, FIM
+tamper detection on the binary/config/journal, rootcheck) and custom manager
+rules 100101+ for sensor-health and tamper detection, aligned with the
+blueeconomy-security-operations ruleset convention. The RasPi deployment
+runbook — armv7/aarch64 cross-compile, systemd unit, Wazuh agent setup,
+recovery drill — is in `docs/raspi-gateway-deployment.md`.
+
 ## Schema contract
 
 `schemas/gateway-telemetry-profile.schema.json` mirrors the `TelemetryFrame` contract in `src/lib.rs` (the code is authoritative). `tests/schema_contract.rs` runs in CI and fails on drift: it compares the schema field set with serializer output and round-trips valid and invalid documents through both the schema and the validator.

@@ -122,7 +122,7 @@ impl StateStore for FileStateStore {
                 code: "state_store_encode_failed",
                 message: error.to_string(),
             })?;
-        let observed = hex_lowercase(Sha256::digest(&payload_bytes));
+        let observed = hex_lowercase(Sha256::digest(payload_bytes));
         if observed != envelope.payload_sha256 {
             return Err(ValidationError {
                 code: "state_store_checksum_mismatch",
@@ -159,7 +159,7 @@ impl StateStore for FileStateStore {
         })?;
         let envelope = StateStoreEnvelope {
             schema_version: STATE_STORE_SCHEMA_VERSION.to_owned(),
-            payload_sha256: hex_lowercase(Sha256::digest(&payload_bytes)),
+            payload_sha256: hex_lowercase(Sha256::digest(payload_bytes)),
             payload: snapshot.clone(),
         };
         let encoded = serde_json::to_vec(&envelope).map_err(|error| ValidationError {

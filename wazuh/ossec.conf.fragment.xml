@@ -1,0 +1,61 @@
+<!--
+  Wazuh agent (ossec.conf) fragment for the vessel-side Raspberry Pi gateway
+  running blueeconomy-waterway-safety's `gateway` binary (Workstream B §3.2).
+
+  Install inside the existing <ossec_config> on the gateway agent. Paths are
+  the deployment defaults from docs/raspi-gateway-deployment.md; adjust only
+  via the documented deployment variables.
+
+  Custom rules matching these events live in wazuh/rules/waterway-gateway-rules.xml
+  (rule IDs 100101+), compatible with the blueeconomy-security-operations
+  detection-engineering lifecycle (wazuh/detection-engineering-lifecycle.md).
+-->
+
+<!-- Gateway structured event log (JSON lines emitted by the gateway binary
+     via its journald unit, mirrored to /var/log/blueeconomy/gateway.log by
+     the systemd StandardOutput=append: directive in the deployment doc). -->
+<localfile>
+  <log_format>json</log_format>
+  <location>/var/log/blueeconomy/gateway.log</location>
+  <out_format>$(log)</out_format>
+</localfile>
+
+<!-- Journal overflow dead-letter sink: every line here means telemetry was
+     evicted under the bounded-journal overflow policy. Never ignore. -->
+<localfile>
+  <log_format>json</log_format>
+  <location>/var/lib/blueeconomy/journal/overflow-dead-letter.jsonl</location>
+</localfile>
+
+<!-- File integrity monitoring: tamper detection on the gateway binary, its
+     environment config, and the journal directory. Real-time where the
+     kernel supports it; the RasPi images enable inotify. -->
+<syscheck>
+  <directories check_all="yes" realtime="yes">/opt/blueeconomy/bin</directories>
+  <directories check_all="yes" realtime="yes">/etc/blueeconomy</directories>
+  <directories check_all="yes" report_changes="no">/var/lib/blueeconomy/journal</directories>
+  <frequency>300</frequency>
+  <scan_on_start>yes</scan_on_start>
+</syscheck>
+
+<!-- Rootkit and policy-anomaly detection for the gateway host. -->
+<rootcheck>
+  <disabled>no</disabled>
+  <check_files>yes</check_files>
+  <check_trojans>yes</check_trojans>
+  <check_dev>yes</check_dev>
+  <check_sys>yes</check_sys>
+  <check_pids>yes</check_pids>
+  <check_ports>yes</check_ports>
+  <check_if>yes</check_if>
+  <frequency>3600</frequency>
+  <skip_nfs>yes</skip_nfs>
+</rootcheck>
+
+<!-- Sensor-health heartbeat visibility: the gateway emits a heartbeat frame
+     every HEARTBEAT_INTERVAL_SECONDS; the manager-side rules (100101+)
+     alert when the expected heartbeat frequency is violated. -->
+<labels>
+  <label key="workstream">corridor-safety</label>
+  <label key="component">vessel-edge-gateway</label>
+</labels>

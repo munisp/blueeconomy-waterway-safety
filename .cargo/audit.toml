@@ -1,0 +1,13 @@
+# cargo-audit configuration.
+#
+# Advisory exceptions below are all INFORMATIONAL "unmaintained" notices that
+# exist only inside the optional `fluvio-transport` client stack (enabled via
+# `--features fluvio-transport`; never part of the default MSRV build). None
+# of them is a vulnerability. Reviewed 2026-08; re-review whenever the
+# fluvio pin is bumped or a real CVE appears for these packages.
+[advisories]
+ignore = [
+    "RUSTSEC-2025-0052", # async-std "discontinued" — via fluvio-future task runtime
+    "RUSTSEC-2024-0384", # instant "unmaintained" — via parking_lot_core (wasm/windows targets only)
+    "RUSTSEC-2024-0436", # paste "unmaintained" — proc-macro via fluvio-sc-schema
+]

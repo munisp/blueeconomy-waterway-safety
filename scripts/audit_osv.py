@@ -25,7 +25,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--lock", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    # Explicitly reviewed advisory exceptions (e.g. informational
+    # "unmaintained" notices in an optional feature tree). Every exception is
+    # recorded in the report and must be justified at the call site.
+    parser.add_argument("--allow-advisory", action="append", default=[])
     arguments = parser.parse_args()
+    allowed = set(arguments.allow_advisory)
 
     with arguments.lock.open("rb") as handle:
         lock = tomllib.load(handle)
@@ -57,6 +62,7 @@ def main() -> int:
             if not isinstance(vulnerability, dict) or not isinstance(vulnerability.get("id"), str):
                 raise RuntimeError("OSV returned a malformed vulnerability reference")
             detail = request_json(f"https://api.osv.dev/v1/vulns/{vulnerability['id']}")
+            suppressed = vulnerability["id"] in allowed
             findings.append(
                 {
                     "package": package,
@@ -65,6 +71,7 @@ def main() -> int:
                     "aliases": detail.get("aliases", []),
                     "modified": detail.get("modified", ""),
                     "withdrawn": detail.get("withdrawn"),
+                    "suppressed": suppressed,
                 }
             )
 
@@ -78,8 +85,9 @@ def main() -> int:
     }
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     arguments.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    print(json.dumps({"locked_package_count": len(packages), "finding_count": len(findings)}))
-    return 1 if findings else 0
+    active = [finding for finding in findings if not finding["suppressed"]]
+    print(json.dumps({"locked_package_count": len(packages), "finding_count": len(active)}))
+    return 1 if active else 0
 
 
 if __name__ == "__main__":

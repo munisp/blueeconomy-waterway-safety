@@ -48,11 +48,58 @@ jobs:
       - name: Check formatting
         run: cargo fmt --check
 
+      # Default features only: the optional uplink transports (fluvio/kafka)
+      # are covered by the feature-transports job on stable; compiling them
+      # here would needlessly pin their MSRV to 1.85.
       - name: Run strict Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Run all Rust tests
         run: cargo test --all-targets --locked
 
       - name: Fail on RustSec advisories
         run: cargo audit --deny warnings
+
+  feature-transports:
+    name: Stable optional transport features
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master at 2026-08-21
+        with:
+          toolchain: stable
+          components: clippy
+
+      # The fluvio-transport/kafka-transport features compile real client
+      # stacks; verify they build warning-free and pass their tests.
+      - name: Clippy with all transport features
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Test with all transport features
+        run: cargo test --all-targets --all-features --locked
+
+  msrv:
+    name: Rust 1.75 MSRV (default features)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust 1.75.0
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master at 2026-08-21
+        with:
+          toolchain: 1.75.0
+
+      # The crate declares rust-version 1.75 for the default (transport-free)
+      # build; the optional transport features require a newer toolchain.
+      - name: Test at MSRV
+        run: cargo test --all-targets --locked

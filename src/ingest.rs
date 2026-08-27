@@ -170,7 +170,7 @@ impl ReorderIngestor {
     /// source_sequence)` order. Call only at end-of-stream; after finalization
     /// no reordering protection remains for the flushed events.
     pub fn finalize(&mut self) -> Vec<ValidatedTelemetry> {
-        let mut remaining: Vec<ValidatedTelemetry> = self.pending.drain(..).collect();
+        let mut remaining: Vec<ValidatedTelemetry> = std::mem::take(&mut self.pending);
         sort_events(&mut remaining);
         remaining
     }
@@ -197,7 +197,7 @@ fn dead_letter(
         gateway_id: truncate_field(&frame.gateway_id),
         source_sequence: frame.source_sequence,
         observed_at: truncate_field(&frame.observed_at),
-        frame_digest_sha256: hex_lowercase(Sha256::digest(&encoded)),
+        frame_digest_sha256: hex_lowercase(Sha256::digest(encoded)),
         detail: detail.to_owned(),
     }
 }

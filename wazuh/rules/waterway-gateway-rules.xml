@@ -1,0 +1,116 @@
+<!--
+  Custom Wazuh rules for the vessel-side waterway-safety edge gateway.
+  Rule ID block 100101+ follows the blueeconomy-security-operations local
+  ruleset convention and ships through that repository's
+  detection-engineering lifecycle (hypothesis, review, test, rollback).
+
+  Event sources:
+  - /var/log/blueeconomy/gateway.log   (gateway JSON event log, decoder 100101)
+  - /var/lib/blueeconomy/journal/overflow-dead-letter.jsonl (overflow sink)
+  - syscheck (FIM) events on gateway paths
+-->
+<group name="blueeconomy,waterway,gateway,">
+
+  <!-- Sensor-health: gateway dead-lettered malformed AIS/NMEA input. -->
+  <rule id="100101" level="5">
+    <decoded_as>json</decoded_as>
+    <field name="event">dead_letter</field>
+    <match>"error_code":"checksum_mismatch"</match>
+    <description>Gateway dead-lettered an NMEA sentence with a bad checksum (possible AIS feed fault or tampering)</description>
+    <group>sensor_health,nmea_integrity,</group>
+  </rule>
+
+  <!-- Sensor-health: any gateway dead-letter event (malformed sentence or
+       LoRaWAN uplink). Volume correlation is a manager-side aggregation of
+       this rule's frequency. -->
+  <rule id="100102" level="4">
+    <decoded_as>json</decoded_as>
+    <field name="event">dead_letter</field>
+    <description>Gateway dead-lettered malformed telemetry input</description>
+    <group>sensor_health,</group>
+  </rule>
+
+  <!-- Sensor-health: journal replay to the uplink failed after recovery. -->
+  <rule id="100103" level="6">
+    <decoded_as>json</decoded_as>
+    <field name="event">journal_replay_failed</field>
+    <description>Journal replay failed during connectivity recovery; buffered telemetry still spooled</description>
+    <group>sensor_health,journal,</group>
+  </rule>
+
+  <!-- Sensor-health: uplink failure forced frames into the local journal. -->
+  <rule id="100104" level="5">
+    <decoded_as>json</decoded_as>
+    <field name="event">uplink_failed_spooled</field>
+    <description>Uplink failure; gateway switched to intermittent buffering profile</description>
+    <group>sensor_health,uplink,</group>
+  </rule>
+
+  <!-- Sensor-health: journal corruption detected at startup. Fail-closed
+       halt; requires operator intervention per the deployment runbook. -->
+  <rule id="100105" level="10">
+    <match>journal_corruption</match>
+    <description>Gateway journal integrity check failed; gateway halted closed</description>
+    <group>sensor_health,journal,integrity_fail,</group>
+  </rule>
+
+  <!-- Tamper: overflow dead-letter sink received evicted records. -->
+  <rule id="100106" level="7">
+    <location>/var/lib/blueeconomy/journal/overflow-dead-letter.jsonl</location>
+    <match>"reason":"journal_overflow"</match>
+    <description>Journal overflow evicted oldest telemetry to the dead-letter sink (bounded-journal policy engaged)</description>
+    <group>tamper_detection,journal,overflow,</group>
+  </rule>
+
+  <!-- Tamper: gateway binary or configuration modified (FIM realtime). -->
+  <rule id="100107" level="11">
+    <if_sid>550</if_sid>
+    <field name="file">^/opt/blueeconomy/bin|^/etc/blueeconomy</field>
+    <description>Gateway binary or configuration file integrity changed</description>
+    <group>tamper_detection,fim,</group>
+  </rule>
+
+  <!-- Tamper: journal files modified outside the gateway process (FIM). -->
+  <rule id="100108" level="9">
+    <if_sid>550</if_sid>
+    <field name="file">^/var/lib/blueeconomy/journal</field>
+    <description>Gateway journal file changed on disk; verify against service activity before trusting replay</description>
+    <group>tamper_detection,fim,journal,</group>
+  </rule>
+
+  <!-- Tamper: gateway configuration was deleted. -->
+  <rule id="100109" level="11">
+    <if_sid>553</if_sid>
+    <field name="file">^/opt/blueeconomy/bin|^/etc/blueeconomy</field>
+    <description>Gateway binary or configuration file deleted</description>
+    <group>tamper_detection,fim,</group>
+  </rule>
+
+  <!-- Sensor-health: heartbeat frame reports uplink unavailable. This rule
+       matches the pier-side decoded heartbeat telemetry when forwarded to
+       the manager (ferries.telemetry.v1 consumer feed). -->
+  <rule id="100110" level="6">
+    <decoded_as>json</decoded_as>
+    <match>"uplink_available":false</match>
+    <description>Gateway heartbeat reports uplink unavailable; vessel is in intermittent buffering profile</description>
+    <group>sensor_health,heartbeat,</group>
+  </rule>
+
+  <!-- Sensor-health: heartbeat reports journal overflow counter activity. -->
+  <rule id="100111" level="8">
+    <decoded_as>json</decoded_as>
+    <match>"records_dead_lettered_overflow":0</match>
+    <negate>yes</negate>
+    <description>Gateway heartbeat reports journal overflow dead letters; data has been evicted under the bounded policy</description>
+    <group>sensor_health,heartbeat,journal,overflow,</group>
+  </rule>
+
+  <!-- Tamper: gateway process stopped emitting its heartbeat log stream
+       (frequency rule; manager escalates when 100110/heartbeats cease). -->
+  <rule id="100112" level="7" frequency="3" timeframe="600">
+    <if_matched_sid>100104</if_matched_sid>
+    <description>Repeated uplink failures within 10 minutes; investigate corridor connectivity or gateway compromise</description>
+    <group>sensor_health,uplink,frequency,</group>
+  </rule>
+
+</group>

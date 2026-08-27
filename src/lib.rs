@@ -9,15 +9,20 @@ use std::fmt::{Display, Formatter, Write};
 use std::fs;
 use std::path::Path;
 
+pub mod gateway;
 pub mod geo;
 pub mod ingest;
+pub mod journal;
+pub mod nmea;
+pub mod sensor;
 pub mod store;
+pub mod uplink;
 
 pub const MAX_PAYLOAD_BYTES: usize = 1_048_576;
 pub const MAX_JSON_BYTES: usize = 1_500_000;
-const MAX_BASE64_BYTES: usize = ((MAX_PAYLOAD_BYTES + 2) / 3) * 4;
+const MAX_BASE64_BYTES: usize = MAX_PAYLOAD_BYTES.div_ceil(3) * 4;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryFrame {
     pub device_id: String,
@@ -801,8 +806,8 @@ mod tests {
     #[test]
     fn accepts_next_batch_from_stream_cursor() {
         let first = valid_frame();
-        let first_evidence =
-            validate_batch_evidence(&[first.clone()]).expect("first batch should validate");
+        let first_evidence = validate_batch_evidence(std::slice::from_ref(&first))
+            .expect("first batch should validate");
         let cursor = TelemetryStreamCursor {
             device_id: first_evidence.device_id,
             gateway_id: first_evidence.gateway_id,
@@ -823,7 +828,8 @@ mod tests {
     #[test]
     fn persists_and_reloads_stream_cursor() {
         let first = valid_frame();
-        let evidence = validate_batch_evidence(&[first.clone()]).expect("batch should validate");
+        let evidence =
+            validate_batch_evidence(std::slice::from_ref(&first)).expect("batch should validate");
         let cursor = TelemetryStreamCursor {
             device_id: evidence.device_id,
             gateway_id: evidence.gateway_id,
@@ -848,8 +854,8 @@ mod tests {
     #[test]
     fn rejects_replayed_batch_from_stream_cursor() {
         let first = valid_frame();
-        let first_evidence =
-            validate_batch_evidence(&[first.clone()]).expect("first batch should validate");
+        let first_evidence = validate_batch_evidence(std::slice::from_ref(&first))
+            .expect("first batch should validate");
         let cursor = TelemetryStreamCursor {
             device_id: first_evidence.device_id,
             gateway_id: first_evidence.gateway_id,
@@ -1278,7 +1284,8 @@ mod p0_error_path_regressions {
 
     fn valid_cursor() -> TelemetryStreamCursor {
         let first = frame(1);
-        let evidence = validate_batch_evidence(&[first.clone()]).expect("fixture evidence");
+        let evidence =
+            validate_batch_evidence(std::slice::from_ref(&first)).expect("fixture evidence");
         TelemetryStreamCursor {
             device_id: first.device_id,
             gateway_id: first.gateway_id,

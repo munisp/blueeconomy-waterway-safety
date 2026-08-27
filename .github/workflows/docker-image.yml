@@ -1,0 +1,51 @@
+name: Docker image
+
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - '.github/workflows/docker-image.yml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - '.github/workflows/docker-image.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-build:
+    name: Validate and build pinned image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify base images are pinned by digest
+        run: |
+          set -euo pipefail
+          grep -E '^FROM ' Dockerfile | while read -r _ image _; do
+            case "$image" in
+              *@sha256:*) ;;
+              *) echo "base image is not digest pinned: $image"; exit 1 ;;
+            esac
+          done
+
+      - name: Statically validate Dockerfile
+        run: docker build --check .
+
+      - name: Build image without pushing
+        run: docker build --tag blueeconomy-waterway-safety:ci .

@@ -9,11 +9,15 @@ use std::fmt::{Display, Formatter, Write};
 use std::fs;
 use std::path::Path;
 
+pub mod geo;
+pub mod ingest;
+pub mod store;
+
 pub const MAX_PAYLOAD_BYTES: usize = 1_048_576;
 pub const MAX_JSON_BYTES: usize = 1_500_000;
 const MAX_BASE64_BYTES: usize = ((MAX_PAYLOAD_BYTES + 2) / 3) * 4;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelemetryFrame {
     pub device_id: String,
@@ -26,7 +30,7 @@ pub struct TelemetryFrame {
     pub payload_sha256: String,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct TelemetryStreamCursor {
     pub device_id: String,
     pub gateway_id: String,
@@ -190,6 +194,11 @@ pub fn load_stream_cursor(path: &Path) -> Result<TelemetryStreamCursor, Validati
             code: "invalid_cursor_json",
             message: error.to_string(),
         })?;
+    validate_stream_cursor(&cursor)?;
+    Ok(cursor)
+}
+
+fn validate_stream_cursor(cursor: &TelemetryStreamCursor) -> Result<(), ValidationError> {
     validate_identifier("cursor.device_id", &cursor.device_id, 256)?;
     validate_identifier("cursor.gateway_id", &cursor.gateway_id, 256)?;
     if cursor.last_source_sequence == 0 {
@@ -201,7 +210,7 @@ pub fn load_stream_cursor(path: &Path) -> Result<TelemetryStreamCursor, Validati
     validate_timestamp("cursor.last_observed_at", &cursor.last_observed_at)?;
     validate_timestamp("cursor.last_received_at", &cursor.last_received_at)?;
     validate_sha256(&cursor.last_batch_digest_sha256)?;
-    Ok(cursor)
+    Ok(())
 }
 
 pub fn save_stream_cursor(

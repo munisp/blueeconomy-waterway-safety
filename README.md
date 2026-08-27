@@ -26,6 +26,26 @@ The registry is a regular, non-symlink JSON file with schema version `blueeconom
 
 The library also exposes `validate_signed_continuation`, which combines signature/registry verification with strict cursor continuity. It rejects replay, sequence gap, device/gateway change, and timestamp regression before returning the next redacted stream cursor. A real deployment must persist this cursor in an approved durable store with concurrency control.
 
+## Durable cursor and vessel registry store
+
+The `store` module provides `FileStateStore` (behind the pluggable `StateStore` trait) for durable ingestion cursors and vessel track registry state. Writes are atomic (write-tempfile, fsync, rename, fsync parent directory) and each record is protected by a SHA-256 payload checksum and a versioned schema envelope. Any read, size, schema, checksum, or content-validation failure is returned as an error; the store never silently resets to empty state. `StateStoreSnapshot::empty()` exists so that initializing a fresh deployment is an explicit caller decision.
+
+## Geospatial safety analytics
+
+The `geo` module implements the corridor-safety analytics feeding the NIMASA dashboard: boundary-inclusive EEZ/restricted-zone overlap detection on vessel positions (`SafetyZone`, `detect_zone_overlaps`), corridor safety polygon construction from vessel tracks (`build_corridor_polygon`, a conservative buffered convex hull that never under-covers the sailed corridor, with a SHA-256 construction digest for audit evidence), and track freshness evaluation (`evaluate_track_freshness`) against the five-minute KPI (`FRESHNESS_KPI_MAX_STALENESS_SECONDS`). Stale and future-dated tracks are reported explicitly and fail the report closed. Zones and tracks are caller-supplied; the crate ships no built-in geofences.
+
+## Out-of-order telemetry ingestion
+
+The `ingest` module tolerates out-of-order `ferries.telemetry.v1` delivery. `ReorderIngestor` buffers validated frames and re-emits them ordered by `(observed_at, source_sequence)` once they fall outside a watermark-driven, configurable lateness window. Frames arriving later than the window, invalid frames, and frames offered at buffer capacity are rejected to an explicit `DeadLetterEvent` outcome and are never silently applied.
+
+## Schema contract
+
+`schemas/gateway-telemetry-profile.schema.json` mirrors the `TelemetryFrame` contract in `src/lib.rs` (the code is authoritative). `tests/schema_contract.rs` runs in CI and fails on drift: it compares the schema field set with serializer output and round-trips valid and invalid documents through both the schema and the validator.
+
+## Container image
+
+The `Dockerfile` builds a locked release binary and runs it as `nonroot` on a distroless base. Both base images are pinned by digest (the retrieval source is documented inline). The `Docker image` workflow statically validates the Dockerfile, verifies the digest pins, and builds the image on every relevant change.
+
 ## Local fixtures versus agency evidence
 
 The repository includes deterministic local-only Ed25519 fixtures for the unit and CLI tests. They prove code behavior only. They are **not** Ministry device identities, certificates, registry approvals, payload authorisations, gateway connections, or safety-response acceptance evidence.

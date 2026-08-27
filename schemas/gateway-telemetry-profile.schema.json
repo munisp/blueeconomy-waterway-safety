@@ -2,19 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://contracts.blueeconomy.local/s6/gateway-telemetry-profile.schema.json",
   "title": "S6 Gateway Telemetry Profile",
-  "description": "Gateway-neutral input profile. G1 manifest must provide device/gateway identity ownership, transport trust root, signature profile and rules policy version.",
+  "description": "Gateway-neutral telemetry frame profile mirrored from TelemetryFrame in src/lib.rs (the code is the authoritative contract). Field names and value domains match the Rust validator exactly. Two code-enforced rules are not expressible here and remain enforced only in code: identifiers must additionally be free of leading/trailing whitespace and control characters, and payload_sha256 must equal the SHA-256 of the base64-decoded payload bytes. tests/schema_contract.rs fails CI if this document drifts from the Rust types.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["device_id", "gateway_id", "source_sequence", "observed_at", "received_at", "payload_sha256", "classification"],
+  "required": ["device_id", "gateway_id", "source_sequence", "observed_at", "received_at", "data_classification", "payload_base64", "payload_sha256"],
   "properties": {
-    "device_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
-    "gateway_id": {"type": "string", "pattern": "^[A-Za-z0-9._:-]{1,128}$"},
+    "device_id": {"type": "string", "minLength": 1, "maxLength": 256},
+    "gateway_id": {"type": "string", "minLength": 1, "maxLength": 256},
     "source_sequence": {"type": "integer", "minimum": 1},
     "observed_at": {"type": "string", "format": "date-time"},
     "received_at": {"type": "string", "format": "date-time"},
-    "payload_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
-    "classification": {"type": "string", "enum": ["PUBLIC", "RESTRICTED", "CONFIDENTIAL"]},
-    "signature": {"type": "string", "minLength": 1, "description": "G1-defined detached or envelope signature; required when the manifest enables signed transport."},
-    "rules_policy_version": {"type": "string", "minLength": 1, "maxLength": 128}
+    "data_classification": {"type": "string", "enum": ["public", "internal", "confidential", "restricted", "highly_restricted"]},
+    "payload_base64": {"type": "string", "minLength": 4, "maxLength": 1398104, "description": "Standard base64 encoding of 1 to 1048576 payload bytes."},
+    "payload_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
   }
 }

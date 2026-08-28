@@ -239,8 +239,10 @@ pub fn connect(
 }
 
 #[cfg(feature = "fluvio-transport")]
-fn connect_fluvio(topic: &str, _endpoint: &str) -> Result<Box<dyn TelemetryUploader>, UplinkError> {
-    Ok(Box::new(FluvioUploader::connect(topic)?))
+fn connect_fluvio(topic: &str, endpoint: &str) -> Result<Box<dyn TelemetryUploader>, UplinkError> {
+    Ok(Box::new(FluvioUploader::connect_with_endpoint(
+        topic, endpoint,
+    )?))
 }
 
 #[cfg(not(feature = "fluvio-transport"))]
@@ -267,6 +269,34 @@ fn connect_kafka(_topic: &str, _endpoint: &str) -> Result<Box<dyn TelemetryUploa
     ))
 }
 
+/// Resolve the Fluvio client configuration for `UPLINK_ENDPOINT`. An empty
+/// (or whitespace-only) value selects the ambient Fluvio profile managed by
+/// deployment; a non-empty value must be a single `host:port` override with a
+/// numeric port. Anything else is rejected as `invalid_transport_config`
+/// before any network I/O — fail-closed at startup, consistent with the
+/// Kafka path, instead of silently ignoring a mistyped endpoint.
+#[cfg(feature = "fluvio-transport")]
+fn fluvio_config_for_endpoint(endpoint: &str) -> Result<Option<fluvio::FluvioConfig>, UplinkError> {
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let (host, port) = trimmed.rsplit_once(':').ok_or_else(|| {
+        error(
+            "invalid_transport_config",
+            "fluvio endpoint must be a single host:port override",
+        )
+    })?;
+    let port_number = port.parse::<u16>().unwrap_or(0);
+    if host.trim().is_empty() || port_number == 0 {
+        return Err(error(
+            "invalid_transport_config",
+            "fluvio endpoint must be host:port with a port between 1 and 65535",
+        ));
+    }
+    Ok(Some(fluvio::FluvioConfig::new(trimmed)))
+}
+
 /// Primary transport: Fluvio producer for `ferries.telemetry.v1`.
 #[cfg(feature = "fluvio-transport")]
 pub struct FluvioUploader {
@@ -283,11 +313,7 @@ impl FluvioUploader {
     }
 
     pub fn connect_with_endpoint(topic: &str, endpoint: &str) -> Result<Self, UplinkError> {
-        let config = if endpoint.is_empty() {
-            None
-        } else {
-            Some(fluvio::FluvioConfig::new(endpoint))
-        };
+        let config = fluvio_config_for_endpoint(endpoint)?;
         let fluvio = fluvio_future::task::run_block_on(async {
             match config {
                 Some(config) => fluvio::Fluvio::connect_with_config(&config).await,
@@ -508,6 +534,56 @@ mod tests {
         );
         assert_eq!(TransportKind::parse("fluvio"), Ok(TransportKind::Fluvio));
         assert_eq!(TransportKind::parse("kafka"), Ok(TransportKind::Kafka));
+    }
+
+    #[cfg(feature = "fluvio-transport")]
+    #[test]
+    fn fluvio_endpoint_override_is_propagated_to_client_config() {
+        let config = fluvio_config_for_endpoint("pier-fluvio.example.gov:9003")
+            .expect("valid endpoint")
+            .expect("endpoint override must produce an explicit client config");
+        assert_eq!(config.endpoint, "pier-fluvio.example.gov:9003");
+
+        assert!(
+            fluvio_config_for_endpoint("")
+                .expect("empty endpoint")
+                .is_none(),
+            "empty endpoint must select the ambient profile"
+        );
+        assert!(
+            fluvio_config_for_endpoint("   ")
+                .expect("blank endpoint")
+                .is_none(),
+            "whitespace-only endpoint must select the ambient profile"
+        );
+    }
+
+    #[cfg(feature = "fluvio-transport")]
+    #[test]
+    fn fluvio_invalid_endpoint_fails_closed_before_network_io() {
+        for invalid in [
+            "not-an-endpoint",
+            ":9003",
+            "pier-fluvio:abc",
+            "pier-fluvio:",
+            "pier-fluvio:0",
+            "pier-fluvio:65536",
+        ] {
+            let config_error = fluvio_config_for_endpoint(invalid)
+                .err()
+                .unwrap_or_else(|| panic!("endpoint {invalid:?} must be rejected"));
+            assert_eq!(
+                config_error.code, "invalid_transport_config",
+                "endpoint {invalid:?} must be a configuration error"
+            );
+            let connect_error = connect(TransportKind::Fluvio, TELEMETRY_TOPIC, invalid)
+                .err()
+                .unwrap_or_else(|| panic!("connect with endpoint {invalid:?} must fail"));
+            assert_eq!(
+                connect_error.code, "invalid_transport_config",
+                "connect with endpoint {invalid:?} must fail closed at startup"
+            );
+        }
     }
 
     #[cfg(not(feature = "fluvio-transport"))]

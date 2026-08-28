@@ -307,6 +307,14 @@ impl GatewayCore {
         self.counters
     }
 
+    /// Attaches the fleet provenance signer to the batch builder. The
+    /// production binary wires this fail-closed from `PROVENANCE_SIGNING_KEY`
+    /// at startup; once attached every emitted batch carries a signed
+    /// provenance header line.
+    pub fn set_provenance_signer(&mut self, signer: crate::provenance::ProvenanceSigner) {
+        self.batch_builder.set_signer(signer);
+    }
+
     pub fn journal_counters(&self) -> JournalCounters {
         self.journal.counters()
     }

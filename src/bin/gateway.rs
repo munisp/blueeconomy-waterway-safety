@@ -85,6 +85,16 @@ fn run() -> i32 {
             return 1;
         }
     };
+    // Fail-closed startup: without the producer provenance key no batch may
+    // leave this gateway, so the process refuses to run at all.
+    let signer = match blueeconomy_waterway_safety::provenance::ProvenanceSigner::from_env() {
+        Ok(signer) => signer,
+        Err(error) => {
+            eprintln!("gateway: startup failed closed: {error}");
+            return 1;
+        }
+    };
+    core.set_provenance_signer(signer);
     let mut uploader = match uplink::connect(
         config.transport,
         &config.core.topic,

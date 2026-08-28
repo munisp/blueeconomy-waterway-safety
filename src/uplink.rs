@@ -31,8 +31,12 @@
 //! pier-side; adding a gateway-local `zstd` pass requires governance sign-off
 //! for the new dependency and is deliberately not included yet.
 
+use crate::provenance::{ProvenanceSigner, PRODUCER};
 use crate::{hex_lowercase, TelemetryFrame};
 use sha2::{Digest, Sha256};
+
+/// JSON-lines record type tag of the batch provenance header line.
+pub const BATCH_PROVENANCE_RECORD_TYPE: &str = "blueeconomy.waterway-safety.batch-provenance.v1";
 
 pub const BATCH_SCHEMA_DOMAIN: &str = "blueeconomy.waterway-safety.gateway-batch.v1";
 pub const TELEMETRY_TOPIC: &str = "ferries.telemetry.v1";
@@ -106,7 +110,15 @@ pub struct TelemetryBatch {
     pub topic: String,
     pub frame_count: usize,
     pub encoding: BatchEncoding,
+    /// When the builder holds a provenance signer, the payload is a
+    /// self-describing provenance header line (record type
+    /// [`BATCH_PROVENANCE_RECORD_TYPE`]) followed by the frame lines, and
+    /// these fields carry the fleet provenance signature (JWS EdDSA over the
+    /// JCS-canonicalized batch document). Without a signer the payload is
+    /// exactly the frame lines and both fields are `None`.
     pub payload: Vec<u8>,
+    pub signature_key_id: Option<String>,
+    pub provenance_signature: Option<String>,
 }
 
 /// Explicit acknowledgement returned by a successful upload.
@@ -129,6 +141,7 @@ pub struct BatchBuilder {
     topic: String,
     max_records: usize,
     max_payload_bytes: usize,
+    signer: Option<ProvenanceSigner>,
 }
 
 impl BatchBuilder {
@@ -160,7 +173,15 @@ impl BatchBuilder {
             topic,
             max_records,
             max_payload_bytes,
+            signer: None,
         })
+    }
+
+    /// Attaches the fleet provenance signer. Once attached, every batch
+    /// carries a signed provenance header line; the production gateway wires
+    /// this fail-closed from `PROVENANCE_SIGNING_KEY` at startup.
+    pub fn set_signer(&mut self, signer: ProvenanceSigner) {
+        self.signer = Some(signer);
     }
 
     /// Split `frames` into batches, preserving order. Empty input yields no
@@ -214,13 +235,71 @@ impl BatchBuilder {
             digest.update(frame.payload_sha256.as_bytes());
             digest.update([0]);
         }
+        let batch_key = hex_lowercase(digest.finalize());
+        let mut signature_key_id = None;
+        let mut provenance_signature = None;
+        if let Some(signer) = &self.signer {
+            let document = self.batch_document(&batch_key, frames)?;
+            let canonical = crate::provenance::canonicalize(&document).map_err(|e| UplinkError {
+                code: "provenance_signing_failed",
+                message: e.message,
+            })?;
+            let signature = signer.sign(&canonical);
+            let header = serde_json::json!({
+                "record_type": BATCH_PROVENANCE_RECORD_TYPE,
+                "batch_key": batch_key,
+                "frame_count": frames.len(),
+                "producer": PRODUCER,
+                "schema": BATCH_SCHEMA_DOMAIN,
+                "topic": self.topic,
+                "signature_key_id": signer.key_id(),
+                "signature": signature,
+            });
+            let mut header_line = serde_json::to_vec(&header).map_err(|serde_error| UplinkError {
+                code: "batch_encode_failed",
+                message: serde_error.to_string(),
+            })?;
+            header_line.push(b'\n');
+            header_line.extend_from_slice(&payload);
+            payload = header_line;
+            signature_key_id = Some(signer.key_id().to_owned());
+            provenance_signature = Some(signature);
+        }
         Ok(TelemetryBatch {
-            batch_key: hex_lowercase(digest.finalize()),
+            batch_key,
             topic: self.topic.clone(),
             frame_count: frames.len(),
             encoding: BatchEncoding::JsonLines,
             payload,
+            signature_key_id,
+            provenance_signature,
         })
+    }
+
+    /// The signed batch document: the full batch envelope excluding the
+    /// signature field, JCS-canonicalized for the JWS payload.
+    fn batch_document(
+        &self,
+        batch_key: &str,
+        frames: &[&TelemetryFrame],
+    ) -> Result<serde_json::Value, UplinkError> {
+        let mut frame_values = Vec::with_capacity(frames.len());
+        for frame in frames {
+            frame_values
+                .push(serde_json::to_value(frame).map_err(|serde_error| UplinkError {
+                    code: "batch_encode_failed",
+                    message: serde_error.to_string(),
+                })?);
+        }
+        Ok(serde_json::json!({
+            "batchKey": batch_key,
+            "encoding": "json-lines",
+            "frameCount": frames.len(),
+            "frames": frame_values,
+            "producer": PRODUCER,
+            "schema": BATCH_SCHEMA_DOMAIN,
+            "topic": self.topic,
+        }))
     }
 }
 
@@ -441,6 +520,7 @@ impl TelemetryUploader for KafkaUploader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     fn frame(sequence: u64) -> TelemetryFrame {
         TelemetryFrame {
@@ -508,6 +588,103 @@ mod tests {
             let decoded: TelemetryFrame = serde_json::from_slice(line).expect("frame json");
             assert_eq!(&decoded, frame);
         }
+    }
+
+    fn test_signer() -> ProvenanceSigner {
+        ProvenanceSigner::new(crate::provenance::SIGNING_KEY_ID, &[9u8; 32]).expect("valid seed")
+    }
+
+    fn signed_batch_document(batch: &TelemetryBatch, frames: &[TelemetryFrame]) -> serde_json::Value {
+        serde_json::json!({
+            "batchKey": batch.batch_key,
+            "encoding": "json-lines",
+            "frameCount": frames.len(),
+            "frames": frames,
+            "producer": crate::provenance::PRODUCER,
+            "schema": BATCH_SCHEMA_DOMAIN,
+            "topic": batch.topic,
+        })
+    }
+
+    #[test]
+    fn signed_batches_carry_verifiable_provenance_header() {
+        let mut builder = BatchBuilder::new(TELEMETRY_TOPIC, 128, 900_000).expect("builder");
+        builder.set_signer(test_signer());
+        let frames: Vec<TelemetryFrame> = (1..=3).map(frame).collect();
+        let batches = builder.build(&frames).expect("batches");
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(
+            batch.signature_key_id.as_deref(),
+            Some(crate::provenance::SIGNING_KEY_ID)
+        );
+        assert!(batch.provenance_signature.is_some());
+
+        let mut lines = batch.payload.split(|byte| *byte == b'\n');
+        let header_line = lines.next().expect("header line");
+        let header: serde_json::Value =
+            serde_json::from_slice(header_line).expect("header json");
+        assert_eq!(
+            header["record_type"].as_str(),
+            Some(BATCH_PROVENANCE_RECORD_TYPE)
+        );
+        assert_eq!(header["batch_key"].as_str(), Some(batch.batch_key.as_str()));
+        assert_eq!(
+            header["signature"].as_str(),
+            batch.provenance_signature.as_deref()
+        );
+        // Frame lines follow the header unchanged.
+        for (line, frame) in lines.filter(|l| !l.is_empty()).zip(frames.iter()) {
+            let decoded: TelemetryFrame = serde_json::from_slice(line).expect("frame json");
+            assert_eq!(&decoded, frame);
+        }
+
+        // The JWS verifies over the JCS-canonicalized batch document.
+        let signer = test_signer();
+        let verifying = ed25519_dalek::VerifyingKey::from_bytes(
+            &URL_SAFE_NO_PAD
+                .decode(signer.public_key_base64url())
+                .expect("pubkey")
+                .try_into()
+                .map(|b: [u8; 32]| b)
+                .expect("32 bytes"),
+        )
+        .expect("verifying key");
+        let document = signed_batch_document(batch, &frames);
+        let canonical = crate::provenance::canonicalize(&document).expect("canonical");
+        crate::provenance::verify(
+            &verifying,
+            crate::provenance::SIGNING_KEY_ID,
+            &canonical,
+            batch.provenance_signature.as_deref().unwrap(),
+        )
+        .expect("batch provenance signature verifies");
+
+        // Tampering with the batch key breaks verification.
+        let mut tampered = signed_batch_document(batch, &frames);
+        tampered["batchKey"] = serde_json::Value::String("f".repeat(64));
+        let canonical = crate::provenance::canonicalize(&tampered).expect("canonical");
+        let outcome = crate::provenance::verify(
+            &verifying,
+            crate::provenance::SIGNING_KEY_ID,
+            &canonical,
+            batch.provenance_signature.as_deref().unwrap(),
+        )
+        .expect_err("tampered batch document must not verify");
+        assert_eq!(outcome.code, "signature_verification_failed");
+    }
+
+    #[test]
+    fn unsigned_batches_keep_legacy_wire_format() {
+        let builder = BatchBuilder::new(TELEMETRY_TOPIC, 128, 900_000).expect("builder");
+        let frames: Vec<TelemetryFrame> = (1..=2).map(frame).collect();
+        let batch = &builder.build(&frames).expect("batches")[0];
+        assert!(batch.provenance_signature.is_none());
+        assert!(batch.signature_key_id.is_none());
+        // First line is a frame, not a provenance header.
+        let first_line = batch.payload.split(|b| *b == b'\n').next().unwrap();
+        let decoded: TelemetryFrame = serde_json::from_slice(first_line).expect("frame json");
+        assert_eq!(decoded, frames[0]);
     }
 
     #[test]

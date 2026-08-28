@@ -14,6 +14,7 @@ pub mod geo;
 pub mod ingest;
 pub mod journal;
 pub mod nmea;
+pub mod provenance;
 pub mod sensor;
 pub mod store;
 pub mod uplink;

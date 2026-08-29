@@ -77,11 +77,27 @@ engine/bilge/life-jacket sensors, see `src/sensor.rs`), and a health heartbeat
 Transport is selected by configuration only (`UPLINK_TRANSPORT`), Dapr-style:
 the same frames flow either way. The Fluvio producer is a real client behind
 `--features fluvio-transport`; the Kafka fallback producer behind
-`--features kafka-transport`. Building without a transport feature is allowed,
+`--features kafka-transport`; the EMQX MQTT uplink (PRA-088) behind
+`--features mqtt-transport`. Building without a transport feature is allowed,
 but selecting that transport at startup fails closed (`transport_unavailable`).
 Batch payload compression is delegated to the transport/SmartModule (see
 `src/uplink.rs` module docs); no gateway-local zstd pass is compiled (would be
 a new dependency requiring governance sign-off).
+
+### MQTT uplink (device plane, PRA-088)
+
+With `UPLINK_TRANSPORT=mqtt` the gateway publishes every provenance-signed
+batch to the EMQX broker at QoS 1 and waits for the broker PUBACK (no
+fire-and-forget). The gateway authenticates **as a registered device**
+against the geo-service device plane through the broker's HTTP authn webhook
+(`/v1/devices/mqtt-auth`): the MQTT client id is the registered device UUID
+and the password is the Ed25519 signed proof over the JCS-canonical
+`{"action":"MQTT_AUTH","deviceId":...,"keyEpoch":N}` payload (JWS kid
+`geo-device-<deviceId>-<epoch>`) — byte-identical to the contract
+`devices.Verifier.VerifyProof` enforces in blueeconomy-geo-service (a
+cross-language test vector is asserted in `src/uplink.rs`). The connection
+is driven to CONNACK at startup: an unreachable broker or a rejected device
+credential fails closed before any frame is accepted.
 
 ### Gateway configuration (environment)
 
@@ -90,8 +106,12 @@ a new dependency requiring governance sign-off).
 | `GATEWAY_ID` | yes | — | gateway identity on every frame |
 | `VESSEL_DEVICE_ID` | yes | — | device identity for AIS position frames |
 | `JOURNAL_DIR` | yes | — | local spool journal directory |
-| `UPLINK_TRANSPORT` | yes | — | `fluvio` or `kafka` |
-| `UPLINK_ENDPOINT` | no | `""` | kafka bootstrap `host:port,...`; fluvio profile override |
+| `UPLINK_TRANSPORT` | yes | — | `fluvio`, `kafka` or `mqtt` |
+| `UPLINK_ENDPOINT` | no | `""` | kafka bootstrap `host:port,...`; fluvio profile override; mqtt broker `host:port` |
+| `UPLINK_MQTT_DEVICE_ID` | mqtt | — | registered device UUID (geo device registry; becomes the MQTT client id) |
+| `UPLINK_MQTT_KEY_EPOCH` | mqtt | — | registered device key epoch (≥1) |
+| `UPLINK_MQTT_DEVICE_PRIVATE_KEY` | mqtt | — | base64url Ed25519 device key (64-byte keypair or 32-byte seed); signs the broker proof |
+| `UPLINK_MQTT_TLS_CA_CERT` | no | `""` | PEM CA path selecting the MQTTS listener (8883) |
 | `TELEMETRY_TOPIC` | no | `ferries.telemetry.v1` | unified ingestion topic |
 | `DATA_CLASSIFICATION` | no | `internal` | approved classification value |
 | `AIS_LISTEN_ADDR` | no | `127.0.0.1:10110` | NMEA TCP listener |

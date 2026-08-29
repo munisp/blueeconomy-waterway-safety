@@ -13,6 +13,16 @@
 //! - `kafka` (fallback): real blocking producer behind the `kafka-transport`
 //!   cargo feature, for sites where only the Kafka topic
 //!   `ferries.telemetry.v1` is reachable.
+//! - `mqtt` (device-plane, PRA-088): MQTT publish to the EMQX broker behind
+//!   the `mqtt-transport` cargo feature. The gateway authenticates AS A
+//!   REGISTERED DEVICE against the geo-service device plane via the broker's
+//!   HTTP authn webhook (`/v1/devices/mqtt-auth`): the MQTT client id is the
+//!   registered device id and the password is the Ed25519 signed proof over
+//!   the JCS-canonical `{"action":"MQTT_AUTH","deviceId":...,"keyEpoch":N}`
+//!   payload (JWS kid `geo-device-<deviceId>-<epoch>`) — the same contract
+//!   the geo `devices.Verifier.VerifyProof` enforces. The connection is
+//!   driven to CONNACK at startup, so an unreachable broker or a rejected
+//!   device credential fails closed before any frame is accepted.
 //!
 //! Building without a transport feature is supported; selecting that
 //! transport in configuration then fails closed with `transport_unavailable`.
@@ -72,6 +82,7 @@ fn error(code: &'static str, message: impl Into<String>) -> UplinkError {
 pub enum TransportKind {
     Fluvio,
     Kafka,
+    Mqtt,
 }
 
 impl TransportKind {
@@ -79,9 +90,10 @@ impl TransportKind {
         match value {
             "fluvio" => Ok(Self::Fluvio),
             "kafka" => Ok(Self::Kafka),
+            "mqtt" => Ok(Self::Mqtt),
             _ => Err(error(
                 "invalid_transport_config",
-                "transport must be 'fluvio' or 'kafka'",
+                "transport must be 'fluvio', 'kafka' or 'mqtt'",
             )),
         }
     }
@@ -90,6 +102,7 @@ impl TransportKind {
         match self {
             Self::Fluvio => "fluvio",
             Self::Kafka => "kafka",
+            Self::Mqtt => "mqtt",
         }
     }
 }
@@ -303,17 +316,204 @@ impl BatchBuilder {
     }
 }
 
+/// Environment variables of the device-plane MQTT credential (PRA-088).
+pub const ENV_MQTT_DEVICE_ID: &str = "UPLINK_MQTT_DEVICE_ID";
+pub const ENV_MQTT_KEY_EPOCH: &str = "UPLINK_MQTT_KEY_EPOCH";
+pub const ENV_MQTT_DEVICE_PRIVATE_KEY: &str = "UPLINK_MQTT_DEVICE_PRIVATE_KEY";
+pub const ENV_MQTT_TLS_CA_CERT: &str = "UPLINK_MQTT_TLS_CA_CERT";
+
+/// Proof action the geo device plane expects for broker authentication
+/// (`devices.ProofActionMQTTAuth`).
+pub const MQTT_PROOF_ACTION: &str = "MQTT_AUTH";
+
+/// Device-plane MQTT credential (geo-service `/v1/devices/mqtt-auth`
+/// contract): the gateway's registered device identity plus the signed
+/// proof it presents as the MQTT password. Built fail-closed at startup —
+/// an absent or malformed credential is a startup error, never a runtime
+/// surprise.
+#[derive(Clone, Debug)]
+pub struct MqttDeviceAuth {
+    device_id: String,
+    key_epoch: u32,
+    /// JWS compact proof: EdDSA over the JCS-canonical
+    /// `{"action":"MQTT_AUTH","deviceId":...,"keyEpoch":N}` payload with kid
+    /// `geo-device-<deviceId>-<epoch>`.
+    proof: String,
+    /// Optional PEM CA path enabling the MQTTS listener (8883).
+    tls_ca_cert_path: Option<String>,
+}
+
+impl MqttDeviceAuth {
+    /// Resolves the credential from the environment (fail-closed): the
+    /// device id, the registered key epoch and the device private key are
+    /// all required; the TLS CA path is optional.
+    pub fn from_env() -> Result<Self, UplinkError> {
+        Self::from_env_with(|name| std::env::var(name).ok())
+    }
+
+    /// Test seam for environment resolution.
+    pub fn from_env_with(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, UplinkError> {
+        let read = |name: &str| -> Result<String, UplinkError> {
+            lookup(name)
+                .map(|raw| raw.trim().to_owned())
+                .filter(|raw| !raw.is_empty())
+                .ok_or_else(|| {
+                    error(
+                        "invalid_transport_config",
+                        format!(
+                            "{name} is required for the mqtt transport (device-plane broker \
+                             authentication is mandatory — no anonymous uplink exists)"
+                        ),
+                    )
+                })
+        };
+        let device_id = read(ENV_MQTT_DEVICE_ID)?;
+        let epoch_raw = read(ENV_MQTT_KEY_EPOCH)?;
+        let key_epoch: u32 = epoch_raw.parse().map_err(|_| {
+            error(
+                "invalid_transport_config",
+                format!("{ENV_MQTT_KEY_EPOCH} must be a positive integer key epoch"),
+            )
+        })?;
+        let key_b64 = read(ENV_MQTT_DEVICE_PRIVATE_KEY)?;
+        let key_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            key_b64.as_bytes(),
+        )
+        .map_err(|_| {
+            error(
+                "invalid_transport_config",
+                format!("{ENV_MQTT_DEVICE_PRIVATE_KEY} must be base64url Ed25519 key material"),
+            )
+        })?;
+        let tls_ca_cert_path = lookup(ENV_MQTT_TLS_CA_CERT)
+            .map(|raw| raw.trim().to_owned())
+            .filter(|raw| !raw.is_empty());
+        Self::from_parts(&device_id, key_epoch, &key_bytes, tls_ca_cert_path)
+    }
+
+    /// Validates the parts and builds the signed broker proof.
+    pub fn from_parts(
+        device_id: &str,
+        key_epoch: u32,
+        key_bytes: &[u8],
+        tls_ca_cert_path: Option<String>,
+    ) -> Result<Self, UplinkError> {
+        let device_id = device_id.trim();
+        if !is_uuid(device_id) {
+            return Err(error(
+                "invalid_transport_config",
+                format!("{ENV_MQTT_DEVICE_ID} must be the registered device UUID"),
+            ));
+        }
+        if key_epoch == 0 {
+            return Err(error(
+                "invalid_transport_config",
+                format!("{ENV_MQTT_KEY_EPOCH} must be a positive integer key epoch"),
+            ));
+        }
+        let kid = mqtt_proof_key_id(device_id, key_epoch);
+        let signer = ProvenanceSigner::new(&kid, key_bytes).map_err(|key_error| {
+            error(
+                "invalid_transport_config",
+                format!("{ENV_MQTT_DEVICE_PRIVATE_KEY} is invalid: {}", key_error.message),
+            )
+        })?;
+        let proof_payload = serde_json::json!({
+            "action": MQTT_PROOF_ACTION,
+            "deviceId": device_id,
+            "keyEpoch": key_epoch,
+        });
+        let canonical = crate::provenance::canonicalize(&proof_payload).map_err(|e| {
+            error(
+                "invalid_transport_config",
+                format!("failed to canonicalize the MQTT auth proof: {}", e.message),
+            )
+        })?;
+        let proof = signer.sign(&canonical);
+        Ok(Self {
+            device_id: device_id.to_owned(),
+            key_epoch,
+            proof,
+            tls_ca_cert_path,
+        })
+    }
+
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub fn key_epoch(&self) -> u32 {
+        self.key_epoch
+    }
+
+    /// The JWS compact proof presented as the MQTT password.
+    pub fn proof(&self) -> &str {
+        &self.proof
+    }
+
+    pub fn tls_ca_cert_path(&self) -> Option<&str> {
+        self.tls_ca_cert_path.as_deref()
+    }
+}
+
+/// The JWS kid the geo device plane binds to one device key epoch
+/// (`devices.KeyID`).
+pub fn mqtt_proof_key_id(device_id: &str, key_epoch: u32) -> String {
+    format!("geo-device-{device_id}-{key_epoch}")
+}
+
+/// RFC 4122 UUID shape check (the geo registry keys devices by UUID).
+fn is_uuid(value: &str) -> bool {
+    let segments: Vec<&str> = value.split('-').collect();
+    let lengths = [8usize, 4, 4, 4, 12];
+    if segments.len() != 5 {
+        return false;
+    }
+    segments
+        .iter()
+        .zip(lengths.iter())
+        .all(|(segment, length)| {
+            segment.len() == *length && segment.chars().all(|c| c.is_ascii_hexdigit())
+        })
+}
+
 /// Connect the configured transport. Fails closed with
 /// `transport_unavailable` when the binary was built without the matching
-/// cargo feature.
+/// cargo feature, and with `invalid_transport_config` when the mqtt
+/// transport is selected without its device-plane credential (or a
+/// credential is supplied to a transport that does not consume one).
 pub fn connect(
     kind: TransportKind,
     topic: &str,
     endpoint: &str,
+    auth: Option<&MqttDeviceAuth>,
 ) -> Result<Box<dyn TelemetryUploader>, UplinkError> {
     match kind {
-        TransportKind::Fluvio => connect_fluvio(topic, endpoint),
-        TransportKind::Kafka => connect_kafka(topic, endpoint),
+        TransportKind::Fluvio | TransportKind::Kafka => {
+            if auth.is_some() {
+                return Err(error(
+                    "invalid_transport_config",
+                    "the mqtt device credential is only valid with the mqtt transport",
+                ));
+            }
+            match kind {
+                TransportKind::Fluvio => connect_fluvio(topic, endpoint),
+                TransportKind::Kafka => connect_kafka(topic, endpoint),
+                TransportKind::Mqtt => unreachable!(),
+            }
+        }
+        TransportKind::Mqtt => {
+            let auth = auth.ok_or_else(|| {
+                error(
+                    "invalid_transport_config",
+                    "the mqtt transport requires the device-plane credential \
+                     (UPLINK_MQTT_DEVICE_ID / UPLINK_MQTT_KEY_EPOCH / \
+                     UPLINK_MQTT_DEVICE_PRIVATE_KEY)",
+                )
+            })?;
+            connect_mqtt(topic, endpoint, auth)
+        }
     }
 }
 
@@ -517,6 +717,204 @@ impl TelemetryUploader for KafkaUploader {
     }
 }
 
+#[cfg(feature = "mqtt-transport")]
+fn connect_mqtt(
+    topic: &str,
+    endpoint: &str,
+    auth: &MqttDeviceAuth,
+) -> Result<Box<dyn TelemetryUploader>, UplinkError> {
+    Ok(Box::new(MqttUploader::connect(topic, endpoint, auth)?))
+}
+
+#[cfg(not(feature = "mqtt-transport"))]
+fn connect_mqtt(
+    _topic: &str,
+    _endpoint: &str,
+    _auth: &MqttDeviceAuth,
+) -> Result<Box<dyn TelemetryUploader>, UplinkError> {
+    Err(error(
+        "transport_unavailable",
+        "mqtt transport requires rebuilding with --features mqtt-transport",
+    ))
+}
+
+/// Device-plane MQTT uploader (PRA-088): publishes every provenance-signed
+/// batch to the EMQX broker at QoS 1 and waits for the broker's PUBACK —
+/// there is no fire-and-forget, consistent with the Fluvio/Kafka doctrine.
+/// Authentication is the geo device-plane contract carried by
+/// [`MqttDeviceAuth`]: client id = registered device UUID, password =
+/// Ed25519 signed proof (`geo-device-<deviceId>-<epoch>` kid); the broker's
+/// HTTP authn webhook at geo-service `/v1/devices/mqtt-auth` verifies it
+/// against the device registry (ACTIVE status, CURRENT or PREVIOUS-in-grace
+/// key epoch) and never grants superuser.
+///
+/// The embedded single-threaded tokio runtime exists only to drive the
+/// rumqttc event loop; the public surface stays synchronous like the Kafka
+/// fallback.
+#[cfg(feature = "mqtt-transport")]
+pub struct MqttUploader {
+    runtime: tokio::runtime::Runtime,
+    client: rumqttc::AsyncClient,
+    eventloop: rumqttc::EventLoop,
+    topic: String,
+}
+
+#[cfg(feature = "mqtt-transport")]
+impl MqttUploader {
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+    const PUBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+    /// `endpoint` is a single `host:port` broker address. The connection is
+    /// driven to CONNACK here: an unreachable broker or a rejected device
+    /// credential is a startup error, not a first-publish surprise.
+    pub fn connect(topic: &str, endpoint: &str, auth: &MqttDeviceAuth) -> Result<Self, UplinkError> {
+        let trimmed = endpoint.trim();
+        let (host, port) = trimmed.rsplit_once(':').ok_or_else(|| {
+            error(
+                "invalid_transport_config",
+                "mqtt transport requires UPLINK_ENDPOINT as a single host:port broker address",
+            )
+        })?;
+        let host = host.trim();
+        let port: u16 = port.trim().parse().map_err(|_| {
+            error(
+                "invalid_transport_config",
+                "mqtt transport requires UPLINK_ENDPOINT with a numeric port",
+            )
+        })?;
+        if host.is_empty() || port == 0 {
+            return Err(error(
+                "invalid_transport_config",
+                "mqtt transport requires UPLINK_ENDPOINT with a non-empty host and non-zero port",
+            ));
+        }
+        let mut options = rumqttc::MqttOptions::new(auth.device_id(), host, port);
+        options.set_credentials(auth.device_id(), auth.proof());
+        options.set_keep_alive(std::time::Duration::from_secs(30));
+        options.set_clean_session(true);
+        if let Some(ca_path) = auth.tls_ca_cert_path() {
+            let ca = std::fs::read(ca_path).map_err(|io_error| {
+                error(
+                    "invalid_transport_config",
+                    format!("{ENV_MQTT_TLS_CA_CERT} ({ca_path}) is unreadable: {io_error}"),
+                )
+            })?;
+            options.set_transport(rumqttc::Transport::Tls(rumqttc::TlsConfiguration::Simple {
+                ca,
+                alpn: None,
+                client_auth: None,
+            }));
+        }
+        let (client, eventloop) = rumqttc::AsyncClient::new(options, 16);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|io_error| {
+                error(
+                    "transport_unavailable",
+                    format!("failed to start the mqtt event runtime: {io_error}"),
+                )
+            })?;
+        let mut uploader = Self {
+            runtime,
+            client,
+            eventloop,
+            topic: topic.to_owned(),
+        };
+        uploader.wait_for_connack()?;
+        Ok(uploader)
+    }
+
+    /// Pumps the event loop until the broker's CONNACK arrives (or the
+    /// timeout/error path fails closed). A non-success return code means the
+    /// device credential was rejected — surfaced as `uplink_connect_failed`.
+    fn wait_for_connack(&mut self) -> Result<(), UplinkError> {
+        self.runtime.block_on(async {
+            let deadline = tokio::time::Instant::now() + Self::CONNECT_TIMEOUT;
+            loop {
+                match tokio::time::timeout_at(deadline, self.eventloop.poll()).await {
+                    Ok(Ok(rumqttc::Event::Incoming(rumqttc::Incoming::ConnAck(connack)))) => {
+                        if connack.code == rumqttc::ConnectReturnCode::Success {
+                            return Ok(());
+                        }
+                        return Err(error(
+                            "uplink_connect_failed",
+                            format!(
+                                "mqtt broker rejected the device credential: {:?} \
+                                 (geo device-plane authentication failed)",
+                                connack.code
+                            ),
+                        ));
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(connection_error)) => {
+                        return Err(error(
+                            "uplink_connect_failed",
+                            format!("mqtt broker connection failed: {connection_error}"),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(error(
+                            "uplink_connect_failed",
+                            "mqtt broker connection timed out waiting for CONNACK",
+                        ));
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[cfg(feature = "mqtt-transport")]
+impl TelemetryUploader for MqttUploader {
+    fn upload(&mut self, batch: &TelemetryBatch) -> Result<UploadReceipt, UplinkError> {
+        self.runtime.block_on(async {
+            self.client
+                .publish(
+                    batch.topic.as_str(),
+                    rumqttc::QoS::AtLeastOnce,
+                    false,
+                    batch.payload.clone(),
+                )
+                .await
+                .map_err(|client_error| {
+                    error(
+                        "uplink_send_failed",
+                        format!("mqtt publish failed: {client_error}"),
+                    )
+                })?;
+            let deadline = tokio::time::Instant::now() + Self::PUBACK_TIMEOUT;
+            loop {
+                // Exactly one publish is in flight at a time (sequential
+                // uploader), so the first PUBACK after the send is this
+                // batch's broker acknowledgement.
+                match tokio::time::timeout_at(deadline, self.eventloop.poll()).await {
+                    Ok(Ok(rumqttc::Event::Incoming(rumqttc::Incoming::PubAck(_)))) => {
+                        return Ok(UploadReceipt {
+                            batch_key: batch.batch_key.clone(),
+                            topic: batch.topic.clone(),
+                            frame_count: batch.frame_count,
+                        });
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(connection_error)) => {
+                        return Err(error(
+                            "uplink_send_failed",
+                            format!("mqtt broker connection lost before PUBACK: {connection_error}"),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(error(
+                            "uplink_send_failed",
+                            "mqtt broker did not acknowledge the publish (PUBACK timeout)",
+                        ));
+                    }
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -706,11 +1104,13 @@ mod tests {
             "invalid_transport_config"
         );
         assert_eq!(
-            TransportKind::parse("mqtt").unwrap_err().code,
+            TransportKind::parse("gopher").unwrap_err().code,
             "invalid_transport_config"
         );
         assert_eq!(TransportKind::parse("fluvio"), Ok(TransportKind::Fluvio));
         assert_eq!(TransportKind::parse("kafka"), Ok(TransportKind::Kafka));
+        assert_eq!(TransportKind::parse("mqtt"), Ok(TransportKind::Mqtt));
+        assert_eq!(TransportKind::Mqtt.as_str(), "mqtt");
     }
 
     #[cfg(feature = "fluvio-transport")]
@@ -753,7 +1153,7 @@ mod tests {
                 config_error.code, "invalid_transport_config",
                 "endpoint {invalid:?} must be a configuration error"
             );
-            let connect_error = connect(TransportKind::Fluvio, TELEMETRY_TOPIC, invalid)
+            let connect_error = connect(TransportKind::Fluvio, TELEMETRY_TOPIC, invalid, None)
                 .err()
                 .unwrap_or_else(|| panic!("connect with endpoint {invalid:?} must fail"));
             assert_eq!(
@@ -766,13 +1166,223 @@ mod tests {
     #[cfg(not(feature = "fluvio-transport"))]
     #[test]
     fn uncompiled_transport_fails_closed() {
-        let error = connect(TransportKind::Fluvio, TELEMETRY_TOPIC, "")
+        let error = connect(TransportKind::Fluvio, TELEMETRY_TOPIC, "", None)
             .err()
             .expect("uncompiled fluvio transport must fail");
         assert_eq!(error.code, "transport_unavailable");
-        let error = connect(TransportKind::Kafka, TELEMETRY_TOPIC, "127.0.0.1:9092")
+        let error = connect(TransportKind::Kafka, TELEMETRY_TOPIC, "127.0.0.1:9092", None)
             .err()
             .expect("uncompiled kafka transport must fail");
         assert_eq!(error.code, "transport_unavailable");
+    }
+
+    // -----------------------------------------------------------------
+    // Device-plane MQTT uplink (PRA-088): credential construction against
+    // the geo /v1/devices/mqtt-auth contract, fail-closed config gates and
+    // the transport dispatch rules. Broker-dependent behaviour is covered
+    // by the WWS_TEST_MQTT_BROKER-gated round-trip below — honestly gated,
+    // never skipped silently.
+    // -----------------------------------------------------------------
+
+    const TEST_DEVICE_ID: &str = "2f4b6c80-1234-5678-9abc-deadbeef0001";
+
+    fn test_device_key() -> ([u8; 32], ed25519_dalek::SigningKey) {
+        let seed = [7u8; 32];
+        let key = ed25519_dalek::SigningKey::from_bytes(&seed);
+        (seed, key)
+    }
+
+    #[test]
+    fn mqtt_auth_builds_geo_contract_proof() {
+        let (seed, key) = test_device_key();
+        let auth = MqttDeviceAuth::from_parts(TEST_DEVICE_ID, 3, &seed, None)
+            .expect("valid device credential");
+
+        // kid binds the registered device id and epoch.
+        assert_eq!(
+            mqtt_proof_key_id(TEST_DEVICE_ID, 3),
+            "geo-device-2f4b6c80-1234-5678-9abc-deadbeef0001-3"
+        );
+
+        // The proof is a three-segment JWS over the JCS-canonical
+        // {"action":"MQTT_AUTH",...} payload — byte-identical to what the
+        // Go devices.Verifier.VerifyProof re-canonicalizes and checks.
+        let parts: Vec<&str> = auth.proof().split('.').collect();
+        assert_eq!(parts.len(), 3, "proof must be a JWS compact serialization");
+        let header = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            parts[0],
+        )
+        .expect("header decodes");
+        let header: serde_json::Value = serde_json::from_slice(&header).expect("header is JSON");
+        assert_eq!(header["alg"], "EdDSA");
+        assert_eq!(
+            header["kid"],
+            "geo-device-2f4b6c80-1234-5678-9abc-deadbeef0001-3"
+        );
+        let payload = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            parts[1],
+        )
+        .expect("payload decodes");
+        assert_eq!(
+            payload,
+            br#"{"action":"MQTT_AUTH","deviceId":"2f4b6c80-1234-5678-9abc-deadbeef0001","keyEpoch":3}"#
+                .to_vec(),
+            "payload must be the exact JCS-canonical proof document"
+        );
+        // And it verifies against the device public key.
+        crate::provenance::verify(
+            &key.verifying_key(),
+            "geo-device-2f4b6c80-1234-5678-9abc-deadbeef0001-3",
+            &payload,
+            auth.proof(),
+        )
+        .expect("proof must verify against the device public key");
+    }
+
+    #[test]
+    fn mqtt_auth_config_fails_closed() {
+        let (seed, _) = test_device_key();
+        // Non-UUID device id.
+        let error = MqttDeviceAuth::from_parts("gateway-001", 1, &seed, None).unwrap_err();
+        assert_eq!(error.code, "invalid_transport_config");
+        // Zero epoch.
+        let error = MqttDeviceAuth::from_parts(TEST_DEVICE_ID, 0, &seed, None).unwrap_err();
+        assert_eq!(error.code, "invalid_transport_config");
+        // Bad key material.
+        let error = MqttDeviceAuth::from_parts(TEST_DEVICE_ID, 1, &[1u8; 7], None).unwrap_err();
+        assert_eq!(error.code, "invalid_transport_config");
+
+        // Environment resolution: every required variable is mandatory.
+        let error = MqttDeviceAuth::from_env_with(|_| None).unwrap_err();
+        assert_eq!(error.code, "invalid_transport_config");
+        assert!(error.message.contains(ENV_MQTT_DEVICE_ID));
+        let error = MqttDeviceAuth::from_env_with(|name| match name {
+            ENV_MQTT_DEVICE_ID => Some(TEST_DEVICE_ID.to_owned()),
+            _ => None,
+        })
+        .unwrap_err();
+        assert!(error.message.contains(ENV_MQTT_KEY_EPOCH));
+        let error = MqttDeviceAuth::from_env_with(|name| match name {
+            ENV_MQTT_DEVICE_ID => Some(TEST_DEVICE_ID.to_owned()),
+            ENV_MQTT_KEY_EPOCH => Some("not-a-number".to_owned()),
+            _ => None,
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_transport_config");
+        let error = MqttDeviceAuth::from_env_with(|name| match name {
+            ENV_MQTT_DEVICE_ID => Some(TEST_DEVICE_ID.to_owned()),
+            ENV_MQTT_KEY_EPOCH => Some("1".to_owned()),
+            ENV_MQTT_DEVICE_PRIVATE_KEY => Some("not base64url !!!".to_owned()),
+            _ => None,
+        })
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_transport_config");
+
+        // Full environment resolves.
+        let auth = MqttDeviceAuth::from_env_with(|name| match name {
+            ENV_MQTT_DEVICE_ID => Some(TEST_DEVICE_ID.to_owned()),
+            ENV_MQTT_KEY_EPOCH => Some("2".to_owned()),
+            ENV_MQTT_DEVICE_PRIVATE_KEY => Some(base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                seed,
+            )),
+            _ => None,
+        })
+        .expect("complete environment resolves");
+        assert_eq!(auth.device_id(), TEST_DEVICE_ID);
+        assert_eq!(auth.key_epoch(), 2);
+        assert!(auth.tls_ca_cert_path().is_none());
+    }
+
+    #[test]
+    fn mqtt_transport_dispatch_gates() {
+        let (seed, _) = test_device_key();
+        let auth = MqttDeviceAuth::from_parts(TEST_DEVICE_ID, 1, &seed, None).expect("auth");
+
+        // A device credential on a non-mqtt transport is a misconfiguration.
+        let error = connect(TransportKind::Kafka, TELEMETRY_TOPIC, "127.0.0.1:9092", Some(&auth))
+            .err()
+            .expect("device credential on kafka must fail");
+        assert_eq!(error.code, "invalid_transport_config");
+        let error = connect(TransportKind::Fluvio, TELEMETRY_TOPIC, "", Some(&auth))
+            .err()
+            .expect("device credential on fluvio must fail");
+        assert_eq!(error.code, "invalid_transport_config");
+
+        // mqtt without the credential fails closed.
+        let error = connect(TransportKind::Mqtt, TELEMETRY_TOPIC, "emqx:1883", None)
+            .err()
+            .expect("mqtt without the credential must fail");
+        assert_eq!(error.code, "invalid_transport_config");
+    }
+
+    #[cfg(feature = "mqtt-transport")]
+    #[test]
+    fn mqtt_invalid_endpoint_fails_closed_before_network_io() {
+        let (seed, _) = test_device_key();
+        let auth = MqttDeviceAuth::from_parts(TEST_DEVICE_ID, 1, &seed, None).expect("auth");
+        for invalid in ["not-an-endpoint", ":1883", "emqx:abc", "emqx:", "emqx:0"] {
+            let error = connect(TransportKind::Mqtt, TELEMETRY_TOPIC, invalid, Some(&auth))
+                .err()
+                .unwrap_or_else(|| panic!("endpoint {invalid:?} must be rejected"));
+            assert_eq!(
+                error.code, "invalid_transport_config",
+                "endpoint {invalid:?} must be a configuration error"
+            );
+        }
+    }
+
+    #[cfg(feature = "mqtt-transport")]
+    #[test]
+    fn mqtt_unreachable_broker_fails_closed_at_startup() {
+        let (seed, _) = test_device_key();
+        let auth = MqttDeviceAuth::from_parts(TEST_DEVICE_ID, 1, &seed, None).expect("auth");
+        // Nothing listens here: CONNACK never arrives.
+        let error = connect(TransportKind::Mqtt, TELEMETRY_TOPIC, "127.0.0.1:1", Some(&auth))
+            .err()
+            .expect("unreachable broker must fail closed");
+        assert_eq!(error.code, "uplink_connect_failed");
+    }
+
+    #[cfg(not(feature = "mqtt-transport"))]
+    #[test]
+    fn uncompiled_mqtt_transport_fails_closed() {
+        let (seed, _) = test_device_key();
+        let auth = MqttDeviceAuth::from_parts(TEST_DEVICE_ID, 1, &seed, None).expect("auth");
+        let error = connect(TransportKind::Mqtt, TELEMETRY_TOPIC, "emqx:1883", Some(&auth))
+            .err()
+            .expect("uncompiled mqtt transport must fail");
+        assert_eq!(error.code, "transport_unavailable");
+    }
+
+    /// Broker-gated round trip: runs ONLY when WWS_TEST_MQTT_BROKER points
+    /// at a live broker that accepts the test device credential (e.g. an
+    /// EMQX wired to a geo-service with the device provisioned). Absent the
+    /// environment the test is skipped explicitly — the unit matrix above
+    /// covers everything that does not require a broker.
+    #[cfg(feature = "mqtt-transport")]
+    #[test]
+    fn mqtt_upload_round_trip_with_live_broker() {
+        let endpoint = match std::env::var("WWS_TEST_MQTT_BROKER") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => {
+                eprintln!(
+                    "skipping mqtt_upload_round_trip_with_live_broker: \
+                     WWS_TEST_MQTT_BROKER is not set (broker-gated by design)"
+                );
+                return;
+            }
+        };
+        let (seed, _) = test_device_key();
+        let auth = MqttDeviceAuth::from_parts(TEST_DEVICE_ID, 1, &seed, None).expect("auth");
+        let mut uploader = MqttUploader::connect(TELEMETRY_TOPIC, endpoint.trim(), &auth)
+            .expect("live broker must accept the device credential");
+        let builder = BatchBuilder::new(TELEMETRY_TOPIC, 128, 900_000).expect("builder");
+        let batches = builder.build(&[frame(1)]).expect("batch");
+        let receipt = uploader.upload(&batches[0]).expect("PUBACK");
+        assert_eq!(receipt.batch_key, batches[0].batch_key);
+        assert_eq!(receipt.topic, TELEMETRY_TOPIC);
     }
 }

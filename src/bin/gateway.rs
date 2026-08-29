@@ -63,8 +63,11 @@ fn run() -> i32 {
         eprintln!(
             "usage: gateway\n\
              Runs the vessel-side edge gateway. Configuration is environment-only:\n\
-             GATEWAY_ID, VESSEL_DEVICE_ID, JOURNAL_DIR, UPLINK_TRANSPORT (fluvio|kafka),\n\
+             GATEWAY_ID, VESSEL_DEVICE_ID, JOURNAL_DIR, UPLINK_TRANSPORT (fluvio|kafka|mqtt),\n\
              UPLINK_ENDPOINT, TELEMETRY_TOPIC, DATA_CLASSIFICATION, AIS_LISTEN_ADDR,\n\
+             mqtt also requires UPLINK_MQTT_DEVICE_ID, UPLINK_MQTT_KEY_EPOCH,\n\
+             UPLINK_MQTT_DEVICE_PRIVATE_KEY (geo device-plane credential; optional\n\
+             UPLINK_MQTT_TLS_CA_CERT selects the MQTTS listener),\n\
              SENSOR_LISTEN_ADDR, HEARTBEAT_INTERVAL_SECONDS, LATENESS_WINDOW_SECONDS,\n\
              JOURNAL_MAX_SEGMENT_BYTES, JOURNAL_MAX_BYTES, JOURNAL_OVERFLOW_MAX_BYTES,\n\
              BATCH_MAX_RECORDS, BATCH_MAX_BYTES. See README for defaults."
@@ -95,10 +98,26 @@ fn run() -> i32 {
         }
     };
     core.set_provenance_signer(signer);
+    // The mqtt transport authenticates AS A REGISTERED DEVICE against the
+    // geo device plane (PRA-088): the credential is mandatory and resolved
+    // fail-closed at startup, exactly like the provenance key above.
+    let mqtt_auth = match config.transport {
+        uplink::TransportKind::Mqtt => {
+            match blueeconomy_waterway_safety::uplink::MqttDeviceAuth::from_env() {
+                Ok(auth) => Some(auth),
+                Err(error) => {
+                    eprintln!("gateway: startup failed closed: {error}");
+                    return 1;
+                }
+            }
+        }
+        _ => None,
+    };
     let mut uploader = match uplink::connect(
         config.transport,
         &config.core.topic,
         &config.uplink_endpoint,
+        mqtt_auth.as_ref(),
     ) {
         Ok(uploader) => uploader,
         Err(error) => {

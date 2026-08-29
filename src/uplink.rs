@@ -252,13 +252,31 @@ impl BatchBuilder {
         let mut signature_key_id = None;
         let mut provenance_signature = None;
         if let Some(signer) = &self.signer {
+            // Phase-7 OTel: provenance-signing span (no-op unless
+            // OTEL_EXPORTER_OTLP_ENDPOINT is set). Low-cardinality
+            // attributes only — no device ids, no payload hashes.
+            let sign_span = tracing::info_span!(
+                "provenance.sign_batch",
+                topic = %self.topic,
+                batch_frames = frames.len(),
+            );
+            let _sign_guard = sign_span.enter();
             let document = self.batch_document(&batch_key, frames)?;
             let canonical = crate::provenance::canonicalize(&document).map_err(|e| UplinkError {
                 code: "provenance_signing_failed",
                 message: e.message,
             })?;
             let signature = signer.sign(&canonical);
-            let header = serde_json::json!({
+            // W3C propagation carrier (manual): the batch provenance header
+            // carries traceparent/tracestate as ADDITIVE fields so consumers
+            // on every transport (fluvio/kafka/mqtt — the kafka crate speaks
+            // a protocol version without record headers) can join the trace.
+            // Envelope v1.0 compatibility is preserved: fields are optional,
+            // absent when telemetry is disabled, and the signed document
+            // (batchKey/frames/...) is untouched.
+            let mut carrier = crate::telemetry::Carrier::default();
+            crate::telemetry::inject_current_context(&mut carrier);
+            let mut header = serde_json::json!({
                 "record_type": BATCH_PROVENANCE_RECORD_TYPE,
                 "batch_key": batch_key,
                 "frame_count": frames.len(),
@@ -268,6 +286,12 @@ impl BatchBuilder {
                 "signature_key_id": signer.key_id(),
                 "signature": signature,
             });
+            if let Some(traceparent) = carrier.get("traceparent") {
+                header["traceparent"] = serde_json::Value::String(traceparent.to_owned());
+            }
+            if let Some(tracestate) = carrier.get("tracestate") {
+                header["tracestate"] = serde_json::Value::String(tracestate.to_owned());
+            }
             let mut header_line = serde_json::to_vec(&header).map_err(|serde_error| UplinkError {
                 code: "batch_encode_failed",
                 message: serde_error.to_string(),
@@ -630,6 +654,13 @@ impl FluvioUploader {
 #[cfg(feature = "fluvio-transport")]
 impl TelemetryUploader for FluvioUploader {
     fn upload(&mut self, batch: &TelemetryBatch) -> Result<UploadReceipt, UplinkError> {
+        let _upload_span = tracing::info_span!(
+            "uplink.upload",
+            transport = "fluvio",
+            topic = %batch.topic,
+            batch_frames = batch.frame_count,
+        )
+        .entered();
         fluvio_future::task::run_block_on(async {
             self.producer
                 .send(batch.batch_key.clone(), batch.payload.clone())
@@ -697,6 +728,13 @@ impl KafkaUploader {
 #[cfg(feature = "kafka-transport")]
 impl TelemetryUploader for KafkaUploader {
     fn upload(&mut self, batch: &TelemetryBatch) -> Result<UploadReceipt, UplinkError> {
+        let _upload_span = tracing::info_span!(
+            "uplink.upload",
+            transport = "kafka",
+            topic = %batch.topic,
+            batch_frames = batch.frame_count,
+        )
+        .entered();
         let record = kafka::producer::Record {
             key: batch.batch_key.as_str(),
             value: batch.payload.as_slice(),
@@ -868,6 +906,13 @@ impl MqttUploader {
 #[cfg(feature = "mqtt-transport")]
 impl TelemetryUploader for MqttUploader {
     fn upload(&mut self, batch: &TelemetryBatch) -> Result<UploadReceipt, UplinkError> {
+        let _upload_span = tracing::info_span!(
+            "uplink.upload",
+            transport = "mqtt",
+            topic = %batch.topic,
+            batch_frames = batch.frame_count,
+        )
+        .entered();
         self.runtime.block_on(async {
             self.client
                 .publish(

@@ -129,8 +129,15 @@ fn run() -> i32 {
     if let Err(code) = spawn_sources(&config, &sender) {
         return code;
     }
+    // Phase-7 OTel: OTLP gRPC export when OTEL_EXPORTER_OTLP_ENDPOINT is
+    // set; a no-op otherwise (the sanctioned fail-open — telemetry never
+    // gates the uplink). Shutdown flush is bounded at <=5s.
+    let telemetry_guard =
+        blueeconomy_waterway_safety::telemetry::init_telemetry("blueeconomy-waterway-safety");
     log_event("gateway_started", None, None);
-    main_loop(&mut core, uploader.as_mut(), &receiver)
+    let code = main_loop(&mut core, uploader.as_mut(), &receiver);
+    blueeconomy_waterway_safety::telemetry::shutdown_telemetry(telemetry_guard);
+    code
 }
 
 fn main_loop(

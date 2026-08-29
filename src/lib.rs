@@ -17,6 +17,7 @@ pub mod nmea;
 pub mod provenance;
 pub mod sensor;
 pub mod store;
+pub mod telemetry;
 pub mod uplink;
 
 pub const MAX_PAYLOAD_BYTES: usize = 1_048_576;

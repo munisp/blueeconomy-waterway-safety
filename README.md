@@ -126,7 +126,13 @@ recovery drill — is in `docs/raspi-gateway-deployment.md`.
 
 ## Container image
 
-The `Dockerfile` builds a locked release binary and runs it as `nonroot` on a distroless base. Both base images are pinned by digest (the retrieval source is documented inline). The `Docker image` workflow statically validates the Dockerfile, verifies the digest pins, and builds the image on every relevant change.
+The `Dockerfile` builds locked release binaries and runs the vessel-side edge `gateway` as `nonroot` on a distroless base; the gateway is the image `ENTRYPOINT` and is configured environment-only (see the table above — missing required variables fail closed at startup). The image is compiled with the pinned `kafka-transport` uplink, so set `UPLINK_TRANSPORT=kafka` (and `UPLINK_ENDPOINT`) unless you rebuild with `fluvio-transport`. The CLI validator stays available as an auxiliary binary:
+
+```bash
+docker run --entrypoint /blueeconomy-waterway-safety <image> <approved-telemetry.json>
+```
+
+Both base images are pinned by digest (the retrieval source is documented inline). The `Docker image` workflow statically validates the Dockerfile, verifies the digest pins, and builds the image on every relevant change.
 
 ## Local fixtures versus agency evidence
 

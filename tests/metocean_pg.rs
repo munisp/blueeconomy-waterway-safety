@@ -1,30 +1,65 @@
-//! Integration test: the PostgreSQL met-ocean store round-trips readings,
-//! advisories, dead letters, feed health and operator nonces against a real
-//! database. Gated on WWS_TEST_PG_DSN — without a database the test is
-//! skipped explicitly, never silently (mirrors tests/gateway_pg.rs).
+//! PostgreSQL-gated integration tests for the met-ocean store.
+//!
+//! Runs only when `MET_OCEAN_TEST_DATABASE_URL` points at a dedicated,
+//! fresh test database (local stack: `metocean_test`) and the
+//! `metocean-pg-store` feature is enabled. The suite exercises the real
+//! persistence path: migration, idempotent reading ingest, advisory
+//! lifecycle persistence, feed health, delivery records and nonce replay
+//! protection.
 
+#![cfg(feature = "metocean-pg-store")]
+
+use blueeconomy_waterway_safety::metocean::dead_letter;
 use blueeconomy_waterway_safety::metocean::evaluate::{
-    Advisory, AdvisorySource, AdvisoryStatus, CapCertainty, CapMessageType, CapSeverity, CapUrgency,
+    build_cancel_advisory, build_feed_advisory, AdvisoryStatus, CancelReason, CapMessageType,
+    CapSeverity,
 };
-use blueeconomy_waterway_safety::metocean::store::{AdvisoryDelivery, MetoceanStore, PgMetoceanStore};
+use blueeconomy_waterway_safety::metocean::registry::ThresholdParam;
+use blueeconomy_waterway_safety::metocean::store::{
+    AdvisoryDelivery, MetoceanStore, PgMetoceanStore,
+};
 use blueeconomy_waterway_safety::metocean::{
-    FeedAvailability, FeedHealth, FeedKind, MetoceanDeadLetter, MetoceanDeadLetterReason,
-    NormalizedReading, ADVISORY_SCHEMA_VERSION, DEAD_LETTER_SCHEMA_VERSION, READING_SCHEMA_VERSION,
+    FeedAvailability, FeedHealth, FeedKind, FeedSourceConfig, MetoceanDeadLetterReason,
+    NormalizedReading, READING_SCHEMA_VERSION,
 };
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 
-fn dsn() -> Option<String> {
-    std::env::var("WWS_TEST_PG_DSN")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+fn test_store() -> Option<PgMetoceanStore> {
+    let dsn = std::env::var("MET_OCEAN_TEST_DATABASE_URL").ok()?;
+    let mut store = PgMetoceanStore::connect(dsn.trim()).expect("connect to test database");
+    store.migrate().expect("migrate");
+    // Dedicated fresh DB per run: the harness owns this database.
+    for table in [
+        "metocean_delivery",
+        "metocean_advisory",
+        "metocean_reading",
+        "metocean_dead_letter",
+        "metocean_feed_health",
+        "metocean_operator_nonce",
+    ] {
+        store
+            .raw_execute(&format!("DELETE FROM {table}"))
+            .expect("clean test table");
+    }
+    Some(store)
 }
 
-fn reading(id: &str) -> NormalizedReading {
+fn feed() -> FeedSourceConfig {
+    FeedSourceConfig {
+        feed_id: "feed-it".to_owned(),
+        kind: FeedKind::OpenMeteoMarine,
+        base_url: FeedKind::OpenMeteoMarine.default_base_url().to_owned(),
+        poll_interval_seconds: 900,
+        attribution_text: "Weather data by Open-Meteo.com".to_owned(),
+        enabled: true,
+    }
+}
+
+fn reading(id_suffix: &str, fetched_at: &str, wave_height: f64) -> NormalizedReading {
     NormalizedReading {
         schema_version: READING_SCHEMA_VERSION.to_owned(),
-        reading_id: id.to_owned(),
-        feed_id: "feed-pg-it".to_owned(),
+        reading_id: format!("mor-it-{id_suffix}"),
+        feed_id: "feed-it".to_owned(),
         feed_kind: FeedKind::OpenMeteoMarine,
         zone_id: Some("hz-lagos-approach".to_owned()),
         latitude: 6.0,
@@ -32,105 +67,139 @@ fn reading(id: &str) -> NormalizedReading {
         observed_at: None,
         forecast_for: Some("2026-08-30T18:00:00Z".to_owned()),
         model_run_at: None,
-        fetched_at: "2026-08-30T12:00:00Z".to_owned(),
-        wave_height_m: Some(3.2),
+        fetched_at: fetched_at.to_owned(),
+        wave_height_m: Some(wave_height),
         wave_period_s: Some(9.5),
         wave_direction_deg: Some(182.0),
         swell_height_m: Some(1.1),
-        swell_period_s: Some(8.8),
+        swell_period_s: None,
         wind_speed_ms: None,
         wind_gust_ms: None,
         sst_c: Some(28.4),
-        source_payload_sha256: "a".repeat(64),
+        source_payload_sha256: "d".repeat(64),
         attribution_text: "Weather data by Open-Meteo.com".to_owned(),
     }
 }
 
-fn advisory(id: &str) -> Advisory {
-    Advisory {
-        schema_version: ADVISORY_SCHEMA_VERSION.to_owned(),
-        advisory_id: id.to_owned(),
-        msg_type: CapMessageType::Alert,
-        phenomenon_code: "HIGH_SIGNIFICANT_WAVE_HEIGHT".to_owned(),
-        urgency: CapUrgency::Expected,
-        severity: CapSeverity::Moderate,
-        certainty: CapCertainty::Likely,
-        zone_id: "hz-lagos-approach".to_owned(),
-        effective_from: "2026-08-30T12:00:00Z".to_owned(),
-        onset: None,
-        effective_until: "2026-08-30T15:00:00Z".to_owned(),
-        bulletin_reference: format!("sha256:{}", "b".repeat(64)),
-        references_advisory_id: String::new(),
-        source: AdvisorySource::Feed,
-        feed_kind: Some(FeedKind::OpenMeteoMarine),
-        attribution_text: "Weather data by Open-Meteo.com".to_owned(),
-        status: AdvisoryStatus::Active,
-        policy_digest_sha256: format!("sha256:{}", "c".repeat(64)),
-        issued_at: "2026-08-30T12:00:00Z".to_owned(),
-        cancel_reason: None,
-    }
+fn advisory_at(now: DateTime<Utc>) -> blueeconomy_waterway_safety::metocean::evaluate::Advisory {
+    build_feed_advisory(
+        &blueeconomy_waterway_safety::metocean::evaluate::FeedAdvisorySpec {
+            msg_type: CapMessageType::Alert,
+            zone_id: "hz-lagos-approach",
+            param: ThresholdParam::WaveHeightM,
+            severity: CapSeverity::Severe,
+            duration_min: 180,
+            references_advisory_id: "",
+        },
+        &[reading("src", "2026-08-30T12:00:00Z", 4.2)],
+        &feed(),
+        &format!("sha256:{}", "e".repeat(64)),
+        now,
+    )
+    .expect("advisory builds")
 }
 
 #[test]
-fn pg_store_round_trips_and_enforces_nonce_replay() {
-    let Some(dsn) = dsn() else {
-        eprintln!(
-            "skipping pg_store_round_trips_and_enforces_nonce_replay: \
-             WWS_TEST_PG_DSN is not set (database-gated by design)"
-        );
+fn pg_store_round_trips_readings_advisories_and_health() {
+    let Some(mut store) = test_store() else {
+        eprintln!("MET_OCEAN_TEST_DATABASE_URL unset; skipping pg-gated test");
         return;
     };
-    let mut store = PgMetoceanStore::connect(&dsn).expect("database connects");
-    store.migrate().expect("schema applies");
-    let suffix = format!("it-{}-{}", std::process::id(), 1);
-    let reading = reading(&format!("mor-{suffix}"));
-    let advisory = advisory(&format!("moa-{suffix}"));
-
-    // Readings: idempotent re-ingest.
-    assert!(store.record_reading(&reading).expect("first insert"));
-    assert!(!store.record_reading(&reading).expect("re-ingest is a no-op"));
-    let not_before = DateTime::parse_from_rfc3339("2026-08-30T11:00:00Z")
+    let now = DateTime::parse_from_rfc3339("2026-08-30T12:00:00Z")
         .expect("time")
         .with_timezone(&Utc);
+
+    // Readings: insert + idempotent re-insert.
+    assert!(store
+        .record_reading(&reading("a", "2026-08-30T11:50:00Z", 3.2))
+        .expect("insert"));
+    assert!(!store
+        .record_reading(&reading("a", "2026-08-30T11:50:00Z", 3.2))
+        .expect("idempotent"));
+    store
+        .record_reading(&reading("b", "2026-08-30T11:55:00Z", 1.1))
+        .expect("insert");
+
     let fresh = store
-        .fresh_readings("hz-lagos-approach", "feed-pg-it", not_before)
-        .expect("fresh readings");
-    assert!(fresh.iter().any(|r| r.reading_id == reading.reading_id));
+        .fresh_readings(
+            "hz-lagos-approach",
+            "feed-it",
+            now - Duration::seconds(1800),
+        )
+        .expect("fresh");
+    assert_eq!(fresh.len(), 2);
+    assert_eq!(fresh[0].wave_height_m, Some(3.2));
+    assert_eq!(fresh[0].attribution_text, "Weather data by Open-Meteo.com");
+    let stale_only = store
+        .fresh_readings("hz-lagos-approach", "feed-it", now)
+        .expect("fresh");
+    assert!(stale_only.is_empty());
 
-    // Advisory lifecycle.
-    store.record_advisory(&advisory).expect("record advisory");
+    // Read API window.
+    let window = store
+        .readings(
+            "hz-lagos-approach",
+            now - Duration::hours(1),
+            now + Duration::hours(1),
+        )
+        .expect("readings");
+    assert_eq!(window.len(), 2);
+
+    // Advisory lifecycle: issue, then CANCEL pairs the terminal status.
+    let alert = advisory_at(now);
+    store.record_advisory(&alert).expect("record advisory");
     let active = store
         .active_advisories("hz-lagos-approach")
-        .expect("active advisories");
-    assert!(active
-        .iter()
-        .any(|a| a.advisory_id == advisory.advisory_id));
-    store
-        .set_advisory_status(&advisory.advisory_id, AdvisoryStatus::Cancelled)
-        .expect("cancel");
-    let active = store
-        .active_advisories("hz-lagos-approach")
-        .expect("active advisories");
-    assert!(!active
-        .iter()
-        .any(|a| a.advisory_id == advisory.advisory_id));
+        .expect("active");
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].advisory_id, alert.advisory_id);
 
-    // Dead letters, health, deliveries.
+    let cancel = build_cancel_advisory(
+        &alert,
+        CancelReason::FeedUnavailable,
+        &format!("sha256:{}", "e".repeat(64)),
+        now + Duration::hours(1),
+    )
+    .expect("cancel builds");
+    store.record_advisory(&cancel).expect("record cancel");
     store
-        .record_dead_letter(&MetoceanDeadLetter {
-            schema_version: DEAD_LETTER_SCHEMA_VERSION.to_owned(),
-            feed_id: "feed-pg-it".to_owned(),
-            feed_kind: "open_meteo_marine".to_owned(),
-            reason: MetoceanDeadLetterReason::MalformedPayload,
-            error_code: "invalid_json".to_owned(),
-            payload_sha256: "0".repeat(64),
-            detail: "it".to_owned(),
-            recorded_at: "2026-08-30T12:00:00Z".to_owned(),
+        .set_advisory_status(&alert.advisory_id, AdvisoryStatus::Expired)
+        .expect("status");
+    assert!(store
+        .active_advisories("hz-lagos-approach")
+        .expect("active")
+        .is_empty());
+    let all = store
+        .advisories(Some("hz-lagos-approach"), false)
+        .expect("all advisories");
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[1].msg_type, CapMessageType::Cancel);
+
+    // Delivery record bound to the advisory.
+    store
+        .record_delivery(&AdvisoryDelivery {
+            advisory_id: alert.advisory_id.clone(),
+            channel: "waterways.met_ocean.advisories.v1".to_owned(),
+            delivered_at: "2026-08-30T12:00:01Z".to_owned(),
+            outcome: "ok".to_owned(),
         })
-        .expect("dead letter");
+        .expect("delivery");
+
+    // Dead letter persists.
+    let letter = dead_letter(
+        &feed(),
+        MetoceanDeadLetterReason::MalformedPayload,
+        "invalid_json",
+        b"{bad",
+        "fixture",
+        "2026-08-30T12:00:00Z",
+    );
+    store.record_dead_letter(&letter).expect("dead letter");
+
+    // Feed health upsert.
     store
         .upsert_feed_health(&FeedHealth {
-            feed_id: "feed-pg-it".to_owned(),
+            feed_id: "feed-it".to_owned(),
             feed_kind: "open_meteo_marine".to_owned(),
             enabled: true,
             availability: FeedAvailability::Ok,
@@ -139,28 +208,25 @@ fn pg_store_round_trips_and_enforces_nonce_replay() {
             last_error: None,
             staleness_seconds: None,
         })
-        .expect("health upsert");
+        .expect("upsert");
     let health = store
-        .feed_health("feed-pg-it")
+        .feed_health("feed-it")
         .expect("health")
         .expect("present");
     assert_eq!(health.availability, FeedAvailability::Ok);
-    store
-        .record_delivery(&AdvisoryDelivery {
-            advisory_id: advisory.advisory_id.clone(),
-            channel: "waterways.met_ocean.advisories.v1".to_owned(),
-            delivered_at: "2026-08-30T12:00:00Z".to_owned(),
-            outcome: "ok".to_owned(),
-        })
-        .expect("delivery");
+    assert_eq!(
+        health.last_success_at.as_deref(),
+        Some("2026-08-30T12:00:00Z")
+    );
 
-    // Nonce replay: first claim succeeds, second is refused.
+    // Nonce replay protection: first claim succeeds, replay is refused.
     assert!(store
-        .claim_operator_nonce("ops-key-it", &format!("nonce-{suffix}"), "2026-08-30T12:00:00Z")
-        .expect("first claim"));
+        .claim_operator_nonce("nimasa-ops-lagos-1", "nonce-1", "2026-08-30T12:00:00Z")
+        .expect("claim"));
     assert!(!store
-        .claim_operator_nonce("ops-key-it", &format!("nonce-{suffix}"), "2026-08-30T12:00:01Z")
-        .expect("replay refused"));
-
-    // Cleanup is unnecessary: rows are keyed by the unique suffix.
+        .claim_operator_nonce("nimasa-ops-lagos-1", "nonce-1", "2026-08-30T12:00:01Z")
+        .expect("replay"));
+    assert!(store
+        .claim_operator_nonce("nimasa-ops-lagos-1", "nonce-2", "2026-08-30T12:00:02Z")
+        .expect("distinct nonce"));
 }

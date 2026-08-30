@@ -13,6 +13,7 @@ pub mod gateway;
 pub mod geo;
 pub mod ingest;
 pub mod journal;
+pub mod metocean;
 pub mod nmea;
 pub mod provenance;
 pub mod sensor;

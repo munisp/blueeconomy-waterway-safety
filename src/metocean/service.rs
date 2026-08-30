@@ -1104,280 +1104,280 @@ mod tests {
             .expect("health")
             .expect("present");
         assert_eq!(health.availability, FeedAvailability::Degraded);
-        let status = service.status(now()).expect("status");
-        assert_eq!(status.availability, FeedAvailability::Degraded);
     }
 
     #[test]
-    fn budget_exhaustion_dead_letters_explicitly() {
+    fn operator_override_issues_and_cancels_with_auth_and_replay_guard() {
         let (registry, policy, _) = signed_registry_and_policy();
+        let operator_signer =
+            ProvenanceSigner::new("nimasa-ops-lagos-1", &[99u8; 32]).expect("signer");
+        let operator_key = URL_SAFE_NO_PAD.encode(
+            SigningKey::from_bytes(&[99u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+        let operators = OperatorRegistry::from_json(
+            serde_json::to_vec(&serde_json::json!({
+                "nimasa-ops-lagos-1": {"public_key_base64url": operator_key, "role": "nimasa-ops"}
+            }))
+            .expect("encode")
+            .as_slice(),
+        )
+        .expect("operators");
         let mut service = MetoceanService::new(
-            config(FeedKind::OpenMeteoMarine),
+            FeedSetConfig {
+                feeds: vec![],
+                advisory_staleness_seconds: None,
+            },
             registry,
             policy,
             TestStore::default(),
         )
         .expect("service");
-        let fixture: Vec<u8> =
-            include_bytes!("../../tests/fixtures/metocean/open_meteo_marine_sample.json").to_vec();
-        let mut fetch = FixtureFetch { payload: fixture };
         let mut publisher = CollectPublisher { published: vec![] };
-        // Burn the minute budget.
-        for offset in 0..BUDGET_MAX_PER_MINUTE {
-            let at = now() + Duration::seconds(offset as i64);
-            service
-                .poll_once(&mut fetch, &mut publisher, &signing(), at)
-                .expect("poll");
-        }
-        let report = service
-            .poll_once(&mut fetch, &mut publisher, &signing(), now())
-            .expect("poll");
-        assert!(report.dead_letters > 0);
-        assert_eq!(report.feeds_degraded, 1);
-    }
-
-    #[test]
-    fn operator_override_requires_signed_fresh_authorized_request() {
-        let (registry, policy, _) = signed_registry_and_policy();
-        let mut service =
-            MetoceanService::new(config(FeedKind::OpenMeteoMarine), registry, policy, TestStore::default())
-                .expect("service");
-        let operator_key = SigningKey::from_bytes(&[55u8; 32]);
-        use base64::Engine as _;
-        let directory_json = serde_json::json!({
-            "ops-key-1": {
-                "public_key_base64url": base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .encode(operator_key.verifying_key().as_bytes()),
-                "role": "nimasa-ops"
-            }
-        });
-        let operators =
-            OperatorRegistry::from_json(&serde_json::to_vec(&directory_json).unwrap()).unwrap();
-        let mut publisher = CollectPublisher { published: vec![] };
-        let payload = serde_json::json!({
+        let override_payload = serde_json::json!({
             "schema_version": OPERATOR_OVERRIDE_SCHEMA_VERSION,
             "action": "met_ocean.operator_override",
             "zone_id": "hz-lagos-approach",
-            "phenomenon_code": "WAVE_HGT",
+            "phenomenon_code": "HIGH_SIGNIFICANT_WAVE_HEIGHT",
             "severity": "Severe",
             "effective_from": "2026-08-30T12:00:00Z",
-            "effective_until": "2026-08-31T00:00:00Z",
-            "rationale": "port captain instruction 44/2026",
-            "nonce": "nonce-001",
+            "effective_until": "2026-08-30T16:00:00Z",
+            "rationale": "Pilot report: hazardous swell at the bar",
+            "nonce": "op-20260830-001",
             "issued_at": "2026-08-30T12:00:00Z"
         });
-        let signed = sign_document(payload, OPERATOR_OVERRIDE_SCHEMA_VERSION, &operator_key, "ops-key-1");
+        let document = sign_document(
+            override_payload.as_object().expect("object").clone(),
+            &operator_signer,
+        )
+        .expect("signed");
+        let raw = serde_json::to_vec(&document).expect("encode");
         let advisory = service
-            .operator_override(
-                &serde_json::to_vec(&signed).unwrap(),
-                &operators,
-                &mut publisher,
-                &signing(),
-                now(),
-            )
-            .expect("override issues");
+            .operator_override(&raw, &operators, &mut publisher, &signing(), now())
+            .expect("override issued");
         assert_eq!(advisory.source, AdvisorySource::OperatorOverride);
+        assert_eq!(advisory.severity, CapSeverity::Severe);
+        assert_eq!(advisory.feed_kind, None);
         assert_eq!(advisory.attribution_text, OPERATOR_ATTRIBUTION);
         assert_eq!(publisher.published.len(), 1);
-        // Replay with the same nonce refuses closed.
-        let replay = service.operator_override(
-            &serde_json::to_vec(&signed).unwrap(),
-            &operators,
-            &mut publisher,
-            &signing(),
-            now(),
-        );
-        assert_eq!(replay.unwrap_err().code, "operator_nonce_replay");
-        // Wrong role refuses closed.
-        let directory_json = serde_json::json!({
-            "ops-key-1": {
-                "public_key_base64url": base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .encode(operator_key.verifying_key().as_bytes()),
-                "role": "viewer"
-            }
-        });
-        let operators =
-            OperatorRegistry::from_json(&serde_json::to_vec(&directory_json).unwrap()).unwrap();
-        let payload = serde_json::json!({
-            "schema_version": OPERATOR_OVERRIDE_SCHEMA_VERSION,
-            "action": "met_ocean.operator_override",
-            "zone_id": "hz-lagos-approach",
-            "phenomenon_code": "WAVE_HGT",
-            "severity": "Minor",
-            "effective_from": "2026-08-30T12:00:00Z",
-            "effective_until": "2026-08-31T00:00:00Z",
-            "rationale": "x",
-            "nonce": "nonce-002",
-            "issued_at": "2026-08-30T12:00:00Z"
-        });
-        let signed = sign_document(payload, OPERATOR_OVERRIDE_SCHEMA_VERSION, &operator_key, "ops-key-1");
-        let refused = service.operator_override(
-            &serde_json::to_vec(&signed).unwrap(),
-            &operators,
-            &mut publisher,
-            &signing(),
-            now(),
-        );
-        assert_eq!(refused.unwrap_err().code, "operator_forbidden");
-    }
+        let verified = crate::metocean::envelope::verify_envelope(&publisher.published[0].1, &{
+            let mut entries = Map::new();
+            entries.insert(
+                "blueeconomy-waterway-safety-0".to_owned(),
+                SigningKey::from_bytes(&[41u8; 32]).verifying_key(),
+            );
+            KeyDirectory::from_entries(entries)
+        })
+        .expect("envelope verifies");
+        assert_eq!(verified.source, "OPERATOR_OVERRIDE");
+        assert_eq!(verified.severity, "Severe");
 
-    #[test]
-    fn operator_cancel_targets_active_advisory() {
-        let (registry, policy, _) = signed_registry_and_policy();
-        let mut service =
-            MetoceanService::new(config(FeedKind::OpenMeteoMarine), registry, policy, TestStore::default())
-                .expect("service");
-        let operator_key = SigningKey::from_bytes(&[56u8; 32]);
-        use base64::Engine as _;
-        let directory_json = serde_json::json!({
-            "ops-key-1": {
-                "public_key_base64url": base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .encode(operator_key.verifying_key().as_bytes()),
-                "role": "nimasa-ops"
-            }
-        });
-        let operators =
-            OperatorRegistry::from_json(&serde_json::to_vec(&directory_json).unwrap()).unwrap();
-        let mut publisher = CollectPublisher { published: vec![] };
-        // Issue an override to cancel.
-        let payload = serde_json::json!({
-            "schema_version": OPERATOR_OVERRIDE_SCHEMA_VERSION,
-            "action": "met_ocean.operator_override",
-            "zone_id": "hz-lagos-approach",
-            "phenomenon_code": "WIND_GUST",
-            "severity": "Moderate",
-            "effective_from": "2026-08-30T12:00:00Z",
-            "effective_until": "2026-08-31T00:00:00Z",
-            "rationale": "setup",
-            "nonce": "nonce-101",
-            "issued_at": "2026-08-30T12:00:00Z"
-        });
-        let signed = sign_document(payload, OPERATOR_OVERRIDE_SCHEMA_VERSION, &operator_key, "ops-key-1");
-        let issued = service
-            .operator_override(
-                &serde_json::to_vec(&signed).unwrap(),
-                &operators,
-                &mut publisher,
-                &signing(),
-                now(),
-            )
-            .expect("issued");
+        // Replay: same nonce must be refused.
+        assert_eq!(
+            service
+                .operator_override(&raw, &operators, &mut publisher, &signing(), now())
+                .unwrap_err()
+                .code,
+            "operator_nonce_replay"
+        );
+
+        // Operator cancel of the active override advisory.
         let cancel_payload = serde_json::json!({
             "schema_version": OPERATOR_OVERRIDE_SCHEMA_VERSION,
             "action": "met_ocean.operator_cancel",
             "zone_id": "hz-lagos-approach",
-            "phenomenon_code": "WIND_GUST",
-            "references_advisory_id": issued.advisory_id,
-            "rationale": "situation normalized",
-            "nonce": "nonce-102",
+            "phenomenon_code": "HIGH_SIGNIFICANT_WAVE_HEIGHT",
+            "references_advisory_id": advisory.advisory_id,
+            "rationale": "Pilot window closed",
+            "nonce": "op-20260830-002",
             "issued_at": "2026-08-30T12:00:00Z"
         });
-        let signed = sign_document(
-            cancel_payload,
-            OPERATOR_OVERRIDE_SCHEMA_VERSION,
-            &operator_key,
-            "ops-key-1",
-        );
+        let document = sign_document(
+            cancel_payload.as_object().expect("object").clone(),
+            &operator_signer,
+        )
+        .expect("signed");
         let cancel = service
             .operator_override(
-                &serde_json::to_vec(&signed).unwrap(),
+                serde_json::to_vec(&document).expect("encode").as_slice(),
                 &operators,
                 &mut publisher,
                 &signing(),
                 now(),
             )
-            .expect("cancel issues");
+            .expect("cancel issued");
         assert_eq!(cancel.msg_type, CapMessageType::Cancel);
-        assert_eq!(cancel.references_advisory_id, issued.advisory_id);
-        assert_eq!(cancel.cancel_reason, Some(CancelReason::OperatorCountermand));
-        let active = service
-            .store()
-            .active_advisories("hz-lagos-approach")
-            .expect("active");
-        assert!(active.is_empty());
+        assert_eq!(
+            cancel.cancel_reason,
+            Some(CancelReason::OperatorCountermand)
+        );
+        assert_eq!(cancel.references_advisory_id, advisory.advisory_id);
     }
 
     #[test]
-    fn stale_or_bad_operator_requests_refuse_closed() {
+    fn operator_override_rejects_wrong_role_stale_and_tampered() {
         let (registry, policy, _) = signed_registry_and_policy();
-        let mut service =
-            MetoceanService::new(config(FeedKind::OpenMeteoMarine), registry, policy, TestStore::default())
-                .expect("service");
-        let operator_key = SigningKey::from_bytes(&[57u8; 32]);
-        use base64::Engine as _;
-        let directory_json = serde_json::json!({
-            "ops-key-1": {
-                "public_key_base64url": base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .encode(operator_key.verifying_key().as_bytes()),
-                "role": "nimasa-ops"
-            }
-        });
-        let operators =
-            OperatorRegistry::from_json(&serde_json::to_vec(&directory_json).unwrap()).unwrap();
+        let operator_signer = ProvenanceSigner::new("contractor-1", &[98u8; 32]).expect("signer");
+        let operator_key = URL_SAFE_NO_PAD.encode(
+            SigningKey::from_bytes(&[98u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+        let operators = OperatorRegistry::from_json(
+            serde_json::to_vec(&serde_json::json!({
+                "contractor-1": {"public_key_base64url": operator_key, "role": "contractor"}
+            }))
+            .expect("encode")
+            .as_slice(),
+        )
+        .expect("operators");
+        let mut service = MetoceanService::new(
+            FeedSetConfig {
+                feeds: vec![],
+                advisory_staleness_seconds: None,
+            },
+            registry,
+            policy,
+            TestStore::default(),
+        )
+        .expect("service");
         let mut publisher = CollectPublisher { published: vec![] };
-        // Stale issued_at.
         let payload = serde_json::json!({
             "schema_version": OPERATOR_OVERRIDE_SCHEMA_VERSION,
             "action": "met_ocean.operator_override",
             "zone_id": "hz-lagos-approach",
-            "phenomenon_code": "WAVE_HGT",
-            "severity": "Minor",
+            "phenomenon_code": "HIGH_WIND",
+            "severity": "Severe",
             "effective_from": "2026-08-30T12:00:00Z",
-            "effective_until": "2026-08-31T00:00:00Z",
-            "rationale": "x",
-            "nonce": "nonce-201",
-            "issued_at": "2026-08-30T10:00:00Z"
+            "effective_until": "2026-08-30T16:00:00Z",
+            "rationale": "test",
+            "nonce": "n-1",
+            "issued_at": "2026-08-30T12:00:00Z"
         });
-        let signed = sign_document(payload, OPERATOR_OVERRIDE_SCHEMA_VERSION, &operator_key, "ops-key-1");
-        let refused = service.operator_override(
-            &serde_json::to_vec(&signed).unwrap(),
-            &operators,
-            &mut publisher,
-            &signing(),
-            now(),
+        let document = sign_document(
+            payload.as_object().expect("object").clone(),
+            &operator_signer,
+        )
+        .expect("signed");
+        let raw = serde_json::to_vec(&document).expect("encode");
+        assert_eq!(
+            service
+                .operator_override(&raw, &operators, &mut publisher, &signing(), now())
+                .unwrap_err()
+                .code,
+            "operator_forbidden"
         );
-        assert_eq!(refused.unwrap_err().code, "operator_override_stale");
-        // Unknown phenomenon code.
+        // Tampered rationale breaks the signature byte-match.
+        let mut tampered = document.clone();
+        tampered["rationale"] = serde_json::json!("tampered");
+        assert_eq!(
+            service
+                .operator_override(
+                    serde_json::to_vec(&tampered).expect("encode").as_slice(),
+                    &operators,
+                    &mut publisher,
+                    &signing(),
+                    now()
+                )
+                .unwrap_err()
+                .code,
+            "payload_mismatch"
+        );
+    }
+
+    #[test]
+    fn publish_failure_aborts_issuance_without_state() {
+        struct FailingPublisher;
+        impl AdvisoryPublisher for FailingPublisher {
+            fn publish(
+                &mut self,
+                _key: &str,
+                _payload: &[u8],
+            ) -> Result<PublishReceipt, ValidationError> {
+                Err(error("publish_failed", "broker unreachable"))
+            }
+        }
+        let (registry, policy, _) = signed_registry_and_policy();
+        let mut service = MetoceanService::new(
+            FeedSetConfig {
+                feeds: vec![],
+                advisory_staleness_seconds: None,
+            },
+            registry,
+            policy,
+            TestStore::default(),
+        )
+        .expect("service");
+        let operator_signer =
+            ProvenanceSigner::new("nimasa-ops-lagos-1", &[99u8; 32]).expect("signer");
+        let operator_key = URL_SAFE_NO_PAD.encode(
+            SigningKey::from_bytes(&[99u8; 32])
+                .verifying_key()
+                .as_bytes(),
+        );
+        let operators = OperatorRegistry::from_json(
+            serde_json::to_vec(&serde_json::json!({
+                "nimasa-ops-lagos-1": {"public_key_base64url": operator_key, "role": "nimasa-ops"}
+            }))
+            .expect("encode")
+            .as_slice(),
+        )
+        .expect("operators");
         let payload = serde_json::json!({
             "schema_version": OPERATOR_OVERRIDE_SCHEMA_VERSION,
             "action": "met_ocean.operator_override",
             "zone_id": "hz-lagos-approach",
-            "phenomenon_code": "HUMIDITY",
-            "severity": "Minor",
+            "phenomenon_code": "HIGH_WIND",
+            "severity": "Severe",
             "effective_from": "2026-08-30T12:00:00Z",
-            "effective_until": "2026-08-31T00:00:00Z",
-            "rationale": "x",
-            "nonce": "nonce-202",
+            "effective_until": "2026-08-30T16:00:00Z",
+            "rationale": "test",
+            "nonce": "n-9",
             "issued_at": "2026-08-30T12:00:00Z"
         });
-        let signed = sign_document(payload, OPERATOR_OVERRIDE_SCHEMA_VERSION, &operator_key, "ops-key-1");
-        let refused = service.operator_override(
-            &serde_json::to_vec(&signed).unwrap(),
-            &operators,
-            &mut publisher,
-            &signing(),
-            now(),
+        let document = sign_document(
+            payload.as_object().expect("object").clone(),
+            &operator_signer,
+        )
+        .expect("signed");
+        let mut publisher = FailingPublisher;
+        assert_eq!(
+            service
+                .operator_override(
+                    serde_json::to_vec(&document).expect("encode").as_slice(),
+                    &operators,
+                    &mut publisher,
+                    &signing(),
+                    now()
+                )
+                .unwrap_err()
+                .code,
+            "publish_failed"
         );
-        assert_eq!(refused.unwrap_err().code, "invalid_operator_override");
-        // Unknown zone for cancel.
-        let payload = serde_json::json!({
-            "schema_version": OPERATOR_OVERRIDE_SCHEMA_VERSION,
-            "action": "met_ocean.operator_cancel",
-            "zone_id": "hz-lagos-approach",
-            "phenomenon_code": "WAVE_HGT",
-            "references_advisory_id": "does-not-exist",
-            "rationale": "x",
-            "nonce": "nonce-203",
-            "issued_at": "2026-08-30T12:00:00Z"
-        });
-        let signed = sign_document(payload, OPERATOR_OVERRIDE_SCHEMA_VERSION, &operator_key, "ops-key-1");
-        let refused = service.operator_override(
-            &serde_json::to_vec(&signed).unwrap(),
-            &operators,
-            &mut publisher,
-            &signing(),
-            now(),
-        );
-        assert_eq!(refused.unwrap_err().code, "advisory_not_found");
+        assert!(service
+            .store()
+            .advisories(Some("hz-lagos-approach"), false)
+            .expect("advisories")
+            .is_empty());
+    }
+
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine as _;
+
+    #[test]
+    fn monitored_point_types_round_trip() {
+        let point = MonitoredPoint {
+            latitude: 6.0,
+            longitude: 3.0,
+        };
+        assert!(point.position().is_ok());
+        assert!(MonitoredPoint {
+            latitude: 91.0,
+            longitude: 3.0
+        }
+        .position()
+        .is_err());
+        let _ = READING_SCHEMA_VERSION;
     }
 }

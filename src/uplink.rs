@@ -1215,6 +1215,11 @@ mod tests {
             .err()
             .expect("uncompiled fluvio transport must fail");
         assert_eq!(error.code, "transport_unavailable");
+    }
+
+    #[cfg(not(feature = "kafka-transport"))]
+    #[test]
+    fn uncompiled_kafka_transport_fails_closed() {
         let error = connect(TransportKind::Kafka, TELEMETRY_TOPIC, "127.0.0.1:9092", None)
             .err()
             .expect("uncompiled kafka transport must fail");

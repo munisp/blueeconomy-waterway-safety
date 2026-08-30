@@ -324,7 +324,7 @@ mod pg {
                         &health.feed_id,
                         &health.feed_kind,
                         &health.enabled,
-                        &health.availability,
+                        &availability,
                         &health.last_success_at,
                         &health.last_failure_at,
                         &health.last_error,

@@ -22,6 +22,16 @@ kafka-transport = ["dep:kafka"]
 # JCS-canonical {"action":"MQTT_AUTH",...} payload). Pinned; rustls TLS for
 # the MQTTS listener. Not part of the MSRV-1.75 default build.
 mqtt-transport = ["dep:rumqttc"]
+# Phase-8 met-ocean advisories: HTTPS feed fetch for the ingest adapters
+# (Open-Meteo Marine / Copernicus Marine / NOAA NOMADS). Pinned; rustls TLS.
+# Not part of the MSRV-1.75 default build: without it the adapters still parse
+# documented payloads, but the fetch transport reports unavailable
+# (fail-closed, never fabricates readings).
+http-feeds = ["dep:ureq"]
+# Phase-8 met-ocean advisories: PostgreSQL persistence for readings,
+# advisories, dead letters and delivery receipts. Pinned. Not part of the
+# MSRV-1.75 default build.
+metocean-pg-store = ["dep:postgres"]
 
 [dependencies]
 base64 = "0.23.1"
@@ -44,7 +54,11 @@ tokio = { version = "=1.38.1", default-features = false, features = [
     "rt",
     "time",
 ] }
-chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+# Phase-8 met-ocean advisories need wall-clock issuance timestamps
+# (CAP effective/expires, fetched_at), so `clock` is enabled on the
+# production dependency. Validation code paths still accept injected
+# timestamps and stay deterministic under test.
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"] }
 ed25519-dalek = { version = "=2.1.1", default-features = false, features = ["std"] }
 # Explicitly pinned because newer zeroize releases require Cargo edition-2024 support,
 # while this service maintains the declared Rust 1.75 minimum toolchain.
@@ -53,6 +67,13 @@ base64ct = "=1.6.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10.9"
+# Phase-8 met-ocean: HTTPS fetch for feed adapters (http-feeds feature) and
+# PostgreSQL persistence (metocean-pg-store feature). Both optional and
+# pinned, matching the transport feature-gating discipline above.
+ureq = { version = "=2.10.1", optional = true, default-features = false, features = [
+    "tls",
+] }
+postgres = { version = "=0.19.7", optional = true }
 # Phase-7 OTel wave: tracing + OTLP gRPC export. Disabled (no-op) unless
 # OTEL_EXPORTER_OTLP_ENDPOINT is set; all open-source (Apache-2.0/MIT).
 tracing = "=0.1.41"

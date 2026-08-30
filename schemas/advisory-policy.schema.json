@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.blueeconomy.local/p8/advisory-policy.schema.json",
+  "title": "Signed met-ocean advisory threshold policy (blueeconomy.waterway-safety.advisory-policy.v1)",
+  "description": "Governed threshold policy: warn/severe/(optional extreme) bands per parameter with advisory duration. Signed and verified exactly like the hazard-zone registry; threshold changes never arrive through runtime flags.",
+  "type": "object",
+  "required": ["schema_version", "policy_version", "thresholds", "signature_key_id", "signature"],
+  "properties": {
+    "schema_version": {"const": "blueeconomy.waterway-safety.advisory-policy.v1"},
+    "policy_version": {"type": "string", "maxLength": 128},
+    "thresholds": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "required": ["param", "warn", "severe", "duration_min"],
+        "properties": {
+          "param": {
+            "enum": ["wave_height_m", "swell_height_m", "swell_period_s", "wind_speed_ms", "wind_gust_ms"]
+          },
+          "warn": {"type": "number", "exclusiveMinimum": 0},
+          "severe": {"type": "number"},
+          "extreme": {"type": "number"},
+          "duration_min": {"type": "integer", "minimum": 1, "maximum": 10080}
+        },
+        "additionalProperties": false,
+        "description": "Enforced at load: 0 < warn < severe (< extreme); params unique per policy."
+      }
+    },
+    "signature_key_id": {"type": "string", "maxLength": 256},
+    "signature": {"type": "string"}
+  },
+  "additionalProperties": false
+}

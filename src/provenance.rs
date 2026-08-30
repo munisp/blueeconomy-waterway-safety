@@ -128,7 +128,7 @@ impl ProvenanceSigner {
         format!(
             "{}.{}",
             input,
-            URL_SAFE_NO_PAD.encode(&signature.to_bytes())
+            URL_SAFE_NO_PAD.encode(signature.to_bytes())
         )
     }
 }

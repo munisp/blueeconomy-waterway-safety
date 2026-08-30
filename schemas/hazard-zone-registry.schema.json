@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.blueeconomy.local/p8/hazard-zone-registry.schema.json",
+  "title": "Signed hazard-zone registry (blueeconomy.waterway-safety.hazard-zone-registry.v1)",
+  "description": "Governed WGS-84 hazard-zone geometry for met-ocean advisories. The document loads only as an Ed25519-signed artifact verified against the governance key directory; `signature` is a JWS compact (EdDSA) whose payload is the RFC 8785 JCS canonicalization of the document minus the signature field.",
+  "type": "object",
+  "required": ["schema_version", "registry_version", "zones", "signature_key_id", "signature"],
+  "properties": {
+    "schema_version": {"const": "blueeconomy.waterway-safety.hazard-zone-registry.v1"},
+    "registry_version": {"type": "string", "maxLength": 128},
+    "zones": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "required": ["zone_id", "name", "polygon", "monitored_points"],
+        "properties": {
+          "zone_id": {"type": "string", "maxLength": 128},
+          "name": {"type": "string", "maxLength": 256},
+          "polygon": {
+            "type": "array",
+            "minItems": 3,
+            "maxItems": 256,
+            "items": {"$ref": "#/$defs/point"}
+          },
+          "monitored_points": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 64,
+            "items": {"$ref": "#/$defs/point"},
+            "description": "Sampling points for feeds; each must lie inside the polygon (enforced fail-closed at load)."
+          },
+          "route_refs": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {"type": "string", "maxLength": 128}
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "signature_key_id": {"type": "string", "maxLength": 256},
+    "signature": {"type": "string", "description": "JWS compact serialization (EdDSA) over the canonical document."}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "point": {
+      "type": "object",
+      "required": ["latitude", "longitude"],
+      "properties": {
+        "latitude": {"type": "number", "minimum": -90, "maximum": 90},
+        "longitude": {"type": "number", "minimum": -180, "maximum": 180}
+      },
+      "additionalProperties": false
+    }
+  }
+}

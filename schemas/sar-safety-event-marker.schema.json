@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://contracts.blueeconomy.local/p8/sar-safety-event-marker.schema.json",
+  "title": "Waterway SAR safety-relevant event marker (producer side)",
+  "description": "Phase-8 PRA-098 / ruling C6: the waterway-safety producer marks frames it publishes on ferries.telemetry.v1 that are safety-relevant for search-and-rescue intake. maritime-intelligence owns the SAR engine and consumes this marker; waterway-safety stays producer-only. The marker is an ADDITIVE, OPTIONAL frame-level field `safety_relevant`; frames without it are treated as not safety-marked. This document is the producer-side schema contract for that marker; it does not change the batch provenance or telemetry-frame wire contracts.",
+  "type": "object",
+  "properties": {
+    "safety_relevant": {
+      "type": "boolean",
+      "description": "true marks the frame as carrying a safety-relevant event (vessel/sensor safety event) that SAR intake must consider; absent or false means not marked. Default when absent: false."
+    }
+  },
+  "additionalProperties": true,
+  "x-schema-version": "blueeconomy.waterway-safety.safety-event-marker.v1"
+}

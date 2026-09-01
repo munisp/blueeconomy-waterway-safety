@@ -7,4 +7,6 @@ RUN cargo build --release --locked
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=build /src/target/release/blueeconomy-waterway-safety /blueeconomy-waterway-safety
 USER nonroot:nonroot
+EXPOSE 8080
 ENTRYPOINT ["/blueeconomy-waterway-safety"]
+CMD ["--serve"]

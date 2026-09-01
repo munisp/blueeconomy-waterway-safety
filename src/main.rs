@@ -9,6 +9,8 @@ use std::{env, fs, process};
 fn main() {
     let arguments: Vec<String> = env::args().skip(1).collect();
     match arguments.as_slice() {
+        [flag] if flag == "--serve" => serve_http(None),
+        [flag, bind_addr] if flag == "--serve" => serve_http(Some(bind_addr)),
         [input_path] => {
             let input = read_regular_input(input_path);
             let validated = validate_json(&input).unwrap_or_else(report_error);
@@ -23,11 +25,25 @@ fn main() {
         }
         _ => {
             eprintln!(
-                "usage: blueeconomy-waterway-safety <approved-telemetry-json-file>\n       blueeconomy-waterway-safety --device-registry <approved-registry-json-file> <approved-signed-telemetry-json-file>"
+                "usage: blueeconomy-waterway-safety <approved-telemetry-json-file>\n       blueeconomy-waterway-safety --device-registry <approved-registry-json-file> <approved-signed-telemetry-json-file>\n       blueeconomy-waterway-safety --serve [bind-addr]"
             );
             process::exit(2);
         }
     }
+}
+
+fn serve_http(bind_addr: Option<&str>) {
+    let bind: std::net::SocketAddr = bind_addr
+        .unwrap_or(blueeconomy_waterway_safety::server::DEFAULT_BIND_ADDR)
+        .parse()
+        .unwrap_or_else(|error| report_error(format!("invalid bind address: {error}")));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(report_error);
+    runtime
+        .block_on(blueeconomy_waterway_safety::server::serve(bind))
+        .unwrap_or_else(report_error);
 }
 
 fn read_regular_input(input_path: &str) -> Vec<u8> {

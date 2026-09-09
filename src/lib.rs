@@ -1465,4 +1465,5 @@ mod p0_error_path_regressions {
     }
 }
 
+pub mod observability;
 pub mod server;

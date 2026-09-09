@@ -2,7 +2,13 @@
 name = "blueeconomy-waterway-safety"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+# Bumped from 1.75: opentelemetry-otlp's tonic backend transitively pulls in
+# idna_adapter (needs edition2024, stable since 1.85) and icu_properties/
+# icu_provider (need 1.88 on top of that). Confirmed live by chasing each
+# MSRV error in turn on `cargo build --release --locked`. The Dockerfile
+# floats on rust:1-bookworm rather than pinning a version here, so treat
+# 1.88 as a floor, not a ceiling actually exercised by CI.
+rust-version = "1.88"
 description = "Integrity validation for approved Blue Economy waterway safety telemetry"
 license = "UNLICENSED"
 publish = false
@@ -20,3 +26,10 @@ serde_json = "1.0.151"
 sha2 = "0.10.9"
 axum = { version = "=0.7.9", default-features = false, features = ["http1", "json", "tokio"] }
 tokio = { version = "=1.38.1", features = ["net", "rt-multi-thread", "time"] }
+opentelemetry = "0.28"
+opentelemetry-otlp = { version = "0.28", features = ["grpc-tonic"] }
+opentelemetry_sdk = { version = "0.28", features = ["rt-tokio"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.29"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tower-http = { version = "0.5", features = ["trace"] }

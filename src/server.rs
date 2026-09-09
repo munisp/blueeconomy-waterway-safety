@@ -21,6 +21,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
+use tower_http::trace::TraceLayer;
 
 use crate::{
     load_device_registry, validate_json, validate_signed_json, DeviceRegistry, MAX_JSON_BYTES,
@@ -44,20 +45,23 @@ pub fn router(registry: Option<DeviceRegistry>) -> Router {
         .route("/health", get(health))
         .route("/v1/telemetry/validate", post(validate_telemetry))
         .layer(DefaultBodyLimit::max(MAX_JSON_BYTES))
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
 /// Load the optional device registry from the environment and serve HTTP.
 /// Fail-closed: a configured but unreadable/invalid registry aborts startup.
 pub async fn serve(bind: SocketAddr) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let telemetry_provider = crate::observability::init();
     let registry = load_registry_from_env()?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, router(registry)).await?;
+    let _ = telemetry_provider.shutdown();
     Ok(())
 }
 
-fn load_registry_from_env()
-    -> Result<Option<DeviceRegistry>, Box<dyn std::error::Error + Send + Sync>> {
+fn load_registry_from_env(
+) -> Result<Option<DeviceRegistry>, Box<dyn std::error::Error + Send + Sync>> {
     match std::env::var_os(DEVICE_REGISTRY_ENV) {
         Some(path) if !path.is_empty() => {
             let registry = load_device_registry(Path::new(&path))?;
